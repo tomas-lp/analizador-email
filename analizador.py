@@ -431,10 +431,10 @@ def vt_lookup_url(url: str, api_key: str) -> Dict[str, Any]:
         if e.code == 404:
             return vt_submit_url_scan(url, api_key)
         elif e.code == 401:
-            return {"target": url, "type": "URL", "status": "error", "message": "API Key inválida o no autorizada"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
         elif e.code == 429:
-            return {"target": url, "type": "URL", "status": "error", "message": "Cuota de VirusTotal excedida (Rate Limit)"}
-        return {"target": url, "type": "URL", "status": "error", "message": f"Error HTTP {e.code}"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "Cuota de VirusTotal excedida (Rate Limit)")}
+        return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "Error al consultar VirusTotal")}
     except Exception as e:
         return {"target": url, "type": "URL", "status": "error", "message": str(e)}
 
@@ -460,8 +460,8 @@ def vt_submit_url_scan(url: str, api_key: str) -> Dict[str, Any]:
             }
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"target": url, "type": "URL", "status": "error", "message": "API Key inválida o no autorizada"}
-        return {"target": url, "type": "URL", "status": "not_found", "message": f"Sin reporte previo (HTTP {e.code})"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
+        return {"target": url, "type": "URL", "status": "not_found", "message": get_http_error_detail(e, "Sin reporte previo en VirusTotal")}
     except Exception as e:
         return {"target": url, "type": "URL", "status": "not_found", "message": "Sin reporte previo en VirusTotal"}
 
@@ -509,12 +509,12 @@ def vt_lookup_ip(ip: str, api_key: str) -> Dict[str, Any]:
             }
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return {"target": ip, "type": "IP", "status": "not_found", "message": "Sin registros en VirusTotal"}
+            return {"target": ip, "type": "IP", "status": "not_found", "message": get_http_error_detail(e, "Sin registros en VirusTotal")}
         elif e.code == 401:
-            return {"target": ip, "type": "IP", "status": "error", "message": "API Key inválida o no autorizada"}
+            return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
         elif e.code == 429:
-            return {"target": ip, "type": "IP", "status": "error", "message": "Cuota de VirusTotal excedida (Rate Limit)"}
-        return {"target": ip, "type": "IP", "status": "error", "message": f"Error HTTP {e.code}"}
+            return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "Cuota de VirusTotal excedida (Rate Limit)")}
+        return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "Error al consultar VirusTotal")}
     except Exception as e:
         return {"target": ip, "type": "IP", "status": "error", "message": str(e)}
 
@@ -534,7 +534,8 @@ def vt_lookup_domain(domain: str, api_key: str) -> Dict[str, Any]:
                 "categories": list(attrs.get("categories", {}).values())[:2],
             }
     except urllib.error.HTTPError as error:
-        message = "Dominio sin reporte previo" if error.code == 404 else f"Error HTTP {error.code}"
+        message = "Dominio sin reporte previo" if error.code == 404 else "Error al consultar VirusTotal"
+        message = get_http_error_detail(error, message)
         return {"target": domain, "type": "DOMAIN", "status": "not_found" if error.code == 404 else "error", "message": message}
     except Exception as error:
         return {"target": domain, "type": "DOMAIN", "status": "error", "message": str(error)}
@@ -556,7 +557,8 @@ def vt_lookup_file_hash(sha256: str, api_key: str) -> Dict[str, Any]:
                 "meaningful_name": attrs.get("meaningful_name", ""),
             }
     except urllib.error.HTTPError as error:
-        message = "Hash sin reporte previo; el archivo no fue subido." if error.code == 404 else f"Error HTTP {error.code}"
+        message = "Hash sin reporte previo; el archivo no fue subido." if error.code == 404 else "Error al consultar VirusTotal"
+        message = get_http_error_detail(error, message)
         return {"target": sha256, "type": "FILE", "status": "not_found" if error.code == 404 else "error", "message": message}
     except Exception as error:
         return {"target": sha256, "type": "FILE", "status": "error", "message": str(error)}
@@ -580,7 +582,8 @@ def vt_lookup_file_behavior(sha256: str, api_key: str) -> Dict[str, Any]:
                 "network": len(attributes.get("network_connections", []) or []),
             }
     except urllib.error.HTTPError as error:
-        message = "No hay comportamiento sandbox disponible para este hash." if error.code == 404 else f"Comportamiento no disponible (HTTP {error.code})."
+        message = "No hay comportamiento sandbox disponible para este hash." if error.code == 404 else "Comportamiento no disponible"
+        message = get_http_error_detail(error, message)
         return {"status": "not_found" if error.code == 404 else "error", "message": message}
     except Exception as error:
         return {"status": "error", "message": str(error)}
@@ -676,6 +679,50 @@ def get_http_error_title(error: urllib.error.HTTPError, fallback: str) -> str:
     return message[:240] if message else fallback
 
 
+def get_http_error_detail(error: urllib.error.HTTPError, fallback: str) -> str:
+    """Devuelve el código HTTP junto con la causa explicada por la API."""
+    try:
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except (OSError, UnicodeError):
+        body = ""
+
+    reason = ""
+    if body:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = body
+
+        preferred_keys = ("title", "error", "message", "detail", "description", "reason")
+        messages = []
+
+        def collect_messages(value: Any) -> None:
+            if isinstance(value, dict):
+                for key in preferred_keys:
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate.strip() and candidate.strip() not in messages:
+                        messages.append(candidate.strip())
+                for candidate in value.values():
+                    if isinstance(candidate, (dict, list)):
+                        collect_messages(candidate)
+            elif isinstance(value, list):
+                for candidate in value:
+                    collect_messages(candidate)
+            elif isinstance(value, str) and value.strip():
+                messages.append(value.strip().splitlines()[0])
+
+        collect_messages(payload)
+        reason = " — ".join(messages[:2])
+
+    if not reason and body and not body.startswith("{"):
+        reason = body.splitlines()[0].strip()
+    code = getattr(error, "code", "N/D")
+    if reason:
+        # Evita repetir el código si el proveedor ya lo incluyó en el cuerpo.
+        return f"HTTP {code}: {reason[:240]}"
+    return f"{fallback} (HTTP {code})"
+
+
 def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
     """Envía una URL a urlscan.io con visibilidad unlisted."""
     api_url = "https://urlscan.io/api/v1/scan/"
@@ -711,12 +758,12 @@ def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
         elif e.code == 429:
             message = "Cuota de urlscan excedida (Rate Limit)."
         else:
-            message = f"Error HTTP {e.code} de urlscan."
+            message = "Error al consultar urlscan."
         return {
             "target": url,
             "provider": "urlscan",
             "status": "error",
-            "message": get_http_error_title(e, message),
+            "message": get_http_error_detail(e, message),
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -773,8 +820,8 @@ def urlscan_get_result(result: Dict[str, Any], api_key: str) -> Dict[str, Any]:
         elif e.code == 429:
             message = "Cuota de urlscan excedida al consultar el resultado (Rate Limit)."
         else:
-            message = f"Error HTTP {e.code} al consultar el resultado de urlscan."
-        result.update({"status": "error", "message": get_http_error_title(e, message)})
+            message = "Error al consultar el resultado de urlscan."
+        result.update({"status": "error", "message": get_http_error_detail(e, message)})
         return result
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         result.update({
@@ -842,7 +889,7 @@ def crtsh_lookup_domain(domain: str) -> Dict[str, Any]:
             "target": domain,
             "provider": "crt.sh",
             "status": "error",
-            "message": get_http_error_title(e, f"Error HTTP {e.code} de crt.sh.")
+            "message": get_http_error_detail(e, "Error al consultar crt.sh")
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -901,12 +948,12 @@ def whois_lookup_domain(domain: str, api_key: str) -> Dict[str, Any]:
         elif e.code == 404:
             message = "who.is no encontró datos para este dominio."
         else:
-            message = f"Error HTTP {e.code} de who.is."
+            message = "Error al consultar who.is."
         return {
             "target": domain,
             "provider": "WHOIS",
             "status": "error",
-            "message": get_http_error_title(e, message),
+            "message": get_http_error_detail(e, message),
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -1256,9 +1303,9 @@ def render_eml_analysis(
     if vt_results:
         vt_table = Table(box=box.ROUNDED, expand=True)
         vt_table.add_column("Tipo", style="bold cyan", width=8, justify="center")
-        vt_table.add_column("Indicador / Objetivo (IoC)", style="white", ratio=2)
-        vt_table.add_column("Estado VirusTotal", justify="center", width=20)
-        vt_table.add_column("Detalles / Reputación", style="dim white", ratio=2)
+        vt_table.add_column("Indicador / Objetivo (IoC)", style="white", ratio=2, overflow="fold")
+        vt_table.add_column("Estado VirusTotal", justify="center", width=20, overflow="fold")
+        vt_table.add_column("Detalles / Reputación", style="dim white", ratio=2, overflow="fold")
 
         for res in vt_results:
             target_str = res.get("target", "")
@@ -1291,9 +1338,9 @@ def render_eml_analysis(
     if url_intel_results:
         intel_table = Table(box=box.ROUNDED, expand=True)
         intel_table.add_column("Servicio", style="bold cyan", width=12)
-        intel_table.add_column("URL / Dominio", style="white", ratio=2)
-        intel_table.add_column("Estado", justify="center", width=18)
-        intel_table.add_column("Resultado / Error", style="dim white", ratio=3)
+        intel_table.add_column("URL / Dominio", style="white", ratio=2, overflow="fold")
+        intel_table.add_column("Estado", justify="center", width=18, overflow="fold")
+        intel_table.add_column("Resultado / Error", style="dim white", ratio=3, overflow="fold")
 
         for res in url_intel_results:
             target = res.get("target", "")

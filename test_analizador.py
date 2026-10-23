@@ -42,6 +42,22 @@ class UrlIntelTests(unittest.TestCase):
         finally:
             error.close()
 
+    def test_http_error_detail_keeps_status_and_api_reason(self):
+        error = analizador.urllib.error.HTTPError(
+            "https://example.test/",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error": "DNS Error", "message": "The hostname could not be resolved"}'),
+        )
+
+        try:
+            detail = analizador.get_http_error_detail(error, "Consulta fallida")
+        finally:
+            error.close()
+
+        self.assertEqual(detail, "HTTP 400: DNS Error — The hostname could not be resolved")
+
     def test_analyzes_file_without_executing_it(self):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as file_handle:
             file_handle.write(b"contenido de prueba")
