@@ -636,22 +636,44 @@ def get_url_hostname(url: str) -> Optional[str]:
         return None
 
 
-def get_http_error_detail(error: urllib.error.HTTPError) -> str:
-    """Obtiene una explicación legible del cuerpo de una respuesta HTTP fallida."""
+def get_http_error_title(error: urllib.error.HTTPError, fallback: str) -> str:
+    """Extrae del JSON de error un título breve y legible para mostrar en la tabla."""
     try:
         body = error.read().decode("utf-8", errors="replace").strip()
     except (OSError, UnicodeError):
-        body = ""
-    if not body:
-        return f"HTTP {error.code}: el servicio no devolvió información adicional."
+        return fallback
 
-    # Las APIs suelen devolver JSON con el motivo concreto del rechazo.
+    if not body:
+        return fallback
+
     try:
-        parsed = json.loads(body)
-        body = json.dumps(parsed, ensure_ascii=False, indent=2)
+        payload = json.loads(body)
     except (TypeError, ValueError):
-        pass
-    return f"HTTP {error.code}\nRespuesta del servicio:\n{body[:4000]}"
+        payload = body
+
+    preferred_keys = ("title", "error", "message", "detail", "description", "reason")
+
+    def find_message(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in preferred_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for candidate in value.values():
+                message = find_message(candidate)
+                if message:
+                    return message
+        elif isinstance(value, list):
+            for candidate in value:
+                message = find_message(candidate)
+                if message:
+                    return message
+        elif isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0]
+        return None
+
+    message = find_message(payload)
+    return message[:240] if message else fallback
 
 
 def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
@@ -694,8 +716,7 @@ def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
             "target": url,
             "provider": "urlscan",
             "status": "error",
-            "message": message,
-            "error_detail": get_http_error_detail(e),
+            "message": get_http_error_title(e, message),
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -753,11 +774,7 @@ def urlscan_get_result(result: Dict[str, Any], api_key: str) -> Dict[str, Any]:
             message = "Cuota de urlscan excedida al consultar el resultado (Rate Limit)."
         else:
             message = f"Error HTTP {e.code} al consultar el resultado de urlscan."
-        result.update({
-            "status": "error",
-            "message": message,
-            "error_detail": get_http_error_detail(e),
-        })
+        result.update({"status": "error", "message": get_http_error_title(e, message)})
         return result
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         result.update({
@@ -825,8 +842,7 @@ def crtsh_lookup_domain(domain: str) -> Dict[str, Any]:
             "target": domain,
             "provider": "crt.sh",
             "status": "error",
-            "message": f"Error HTTP {e.code} de crt.sh.",
-            "error_detail": get_http_error_detail(e),
+            "message": get_http_error_title(e, f"Error HTTP {e.code} de crt.sh.")
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -890,8 +906,7 @@ def whois_lookup_domain(domain: str, api_key: str) -> Dict[str, Any]:
             "target": domain,
             "provider": "WHOIS",
             "status": "error",
-            "message": message,
-            "error_detail": get_http_error_detail(e),
+            "message": get_http_error_title(e, message),
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -1278,7 +1293,7 @@ def render_eml_analysis(
         intel_table.add_column("Servicio", style="bold cyan", width=12)
         intel_table.add_column("URL / Dominio", style="white", ratio=2)
         intel_table.add_column("Estado", justify="center", width=18)
-        intel_table.add_column("Detalles", style="dim white", ratio=3)
+        intel_table.add_column("Resultado / Error", style="dim white", ratio=3)
 
         for res in url_intel_results:
             target = res.get("target", "")
@@ -1317,33 +1332,6 @@ def render_eml_analysis(
             border_style="bright_blue"
         ))
 
-        error_results = [
-            result for result in url_intel_results
-            if result.get("status") == "error"
-        ]
-        if error_results:
-            error_lines = Text()
-            for index, result in enumerate(error_results):
-                if index:
-                    error_lines.append("\n\n")
-                error_lines.append(
-                    f"{result.get('provider', 'Servicio')} — {result.get('target', 'N/D')}\n",
-                    style="bold red",
-                )
-                error_lines.append(
-                    f"{result.get('message', 'Error sin descripción.')}\n",
-                    style="bold yellow",
-                )
-                error_lines.append(
-                    result.get("error_detail") or "No se recibió información adicional del servicio.",
-                    style="white",
-                )
-            console.print(Panel(
-                error_lines,
-                title="[bold red]⚠️ Detalle de errores (información completa)[/bold red]",
-                border_style="red",
-                expand=True,
-            ))
     elif data.get("links"):
         console.print(Panel(
             "[dim]No se encontraron URLs HTTP(S) válidas para analizar.[/dim]",

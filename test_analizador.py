@@ -1,5 +1,6 @@
 import json
 import os
+import io
 import tempfile
 import hashlib
 import unittest
@@ -24,6 +25,23 @@ class FakeResponse:
 
 
 class UrlIntelTests(unittest.TestCase):
+    def test_extracts_api_error_title_from_json_body(self):
+        error = analizador.urllib.error.HTTPError(
+            "https://urlscan.io/api/v1/scan/",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error": "DNS Error", "message": "The hostname could not be resolved"}'),
+        )
+
+        try:
+            self.assertEqual(
+                analizador.get_http_error_title(error, "Error HTTP 400"),
+                "DNS Error",
+            )
+        finally:
+            error.close()
+
     def test_analyzes_file_without_executing_it(self):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as file_handle:
             file_handle.write(b"contenido de prueba")
