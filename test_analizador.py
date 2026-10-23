@@ -117,27 +117,41 @@ class UrlIntelTests(unittest.TestCase):
         self.assertIn("%68%6f%6c%61", candidates)
         self.assertIn("48 65 6c 6c 6f 20 77 6f 72 6c 64", candidates)
 
-    @patch.object(analizador.subprocess, "run")
-    def test_runs_cyberchef_magic_locally(self, mocked_run):
-        mocked_run.return_value = Mock(
-            returncode=0,
-            stdout=json.dumps({"output": "texto decodificado", "type": "string"}),
-            stderr="",
-        )
-
-        results = analizador.analyze_obfuscation_with_cyberchef("U29tZSBtYWxpY2lvdXMgcGF5bG9hZA==")
-
+    def test_deobfuscates_base64_native_fallback(self):
+        # Base64 válido de "Hola Mundo!"
+        raw_b64 = "SG9sYSBNdW5kbyE="
+        # Con padding forzado para cumplir candidato >= 16 chars: "SG9sYSBNdW5kbyEgdGVzdA==" ("Hola Mundo! test")
+        candidate = "SG9sYSBNdW5kbyEgdGVzdA=="
+        results = analizador.analyze_obfuscation(candidate)
+        self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "success")
-        self.assertEqual(results[0]["output"], "texto decodificado")
-        command = mocked_run.call_args.args[0]
-        self.assertEqual(command[0], "node")
-        self.assertTrue(command[1].endswith("cyberchef_bridge.mjs"))
+        self.assertEqual(results[0]["output"], "Hola Mundo! test")
 
-    @patch.object(analizador.subprocess, "run", side_effect=FileNotFoundError)
-    def test_reports_missing_node(self, _mocked_run):
-        results = analizador.analyze_obfuscation_with_cyberchef("U29tZSBtYWxpY2lvdXMgcGF5bG9hZA==")
+    def test_deobfuscates_url_and_hex_native_fallback(self):
+        url_encoded = "%68%6f%6c%61%20%6d%75%6e%64%6f"
+        results_url = analizador.analyze_obfuscation(url_encoded)
+        self.assertEqual(results_url[0]["status"], "success")
+        self.assertEqual(results_url[0]["output"], "hola mundo")
 
-        self.assertEqual(results[0]["status"], "unavailable")
+        hex_data = "48656c6c6f20576f726c6421"  # "Hello World!"
+        results_hex = analizador.analyze_obfuscation(hex_data)
+        self.assertEqual(results_hex[0]["status"], "success")
+        self.assertEqual(results_hex[0]["output"], "Hello World!")
+
+    @patch("analizador._decode_candidate_with_chepy")
+    def test_prefers_chepy_when_available(self, mock_chepy):
+        mock_chepy.return_value = ("payload decodificado por chepy", "Chepy (Base64)")
+        candidate = "U29tZSBtYWxpY2lvdXMgcGF5bG9hZA=="
+        results = analizador.analyze_obfuscation(candidate)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(results[0]["output"], "payload decodificado por chepy")
+        self.assertEqual(results[0]["engine"], "Chepy (Base64)")
+
+    def test_backward_compatibility_alias(self):
+        candidate = "SG9sYSBNdW5kbyEgdGVzdA=="
+        results = analizador.analyze_obfuscation_with_cyberchef(candidate)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(results[0]["output"], "Hola Mundo! test")
     def test_analyzes_http_links_with_all_services(self):
         responses = [
             {"uuid": "scan-123", "result": "https://urlscan.io/result/scan-123/"},
@@ -188,7 +202,7 @@ class UrlIntelTests(unittest.TestCase):
 
         self.assertEqual([result["provider"] for result in results], ["urlscan", "crt.sh", "WHOIS"])
         self.assertEqual(results[0]["status"], "success")
-        self.assertEqual(results[0]["visibility"], "unlisted")
+        self.assertEqual(results[0]["visibility"], "public")
         self.assertFalse(results[0]["malicious"])
         self.assertEqual(results[0]["score"], -10)
         self.assertEqual(results[0]["page_title"], "Example")
@@ -197,7 +211,7 @@ class UrlIntelTests(unittest.TestCase):
         self.assertEqual(results[2]["expiration"], "2030-01-01")
 
         self.assertEqual(requests[0].get_header("Api-key"), "test-urlscan-key")
-        self.assertEqual(json.loads(requests[0].data)["visibility"], "unlisted")
+        self.assertEqual(json.loads(requests[0].data)["visibility"], "public")
         self.assertEqual(requests[1].full_url, "https://urlscan.io/api/v1/result/scan-123/")
         self.assertEqual(requests[1].get_header("Api-key"), "test-urlscan-key")
         self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(requests[2].full_url).query)["q"], ["%.example.com"])

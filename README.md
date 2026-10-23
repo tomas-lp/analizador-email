@@ -18,23 +18,19 @@ Herramienta de terminal desarrollada en Python con interfaz estilizada mediante 
 pip install -r requirements.txt
 ```
 
-### Desofuscación automática con CyberChef
+### Desofuscación automática con Chepy (Python CyberChef)
 
-El analizador usa la API local de [CyberChef](https://github.com/gchq/CyberChef) para buscar fragmentos Base64, URL-encoded y hexadecimales en el asunto y cuerpo del correo, y los procesa con la receta `Magic`. No requiere API key ni transmite datos a Internet.
-
-Requiere Node.js 24 e instalar las dependencias JavaScript una vez:
-
-```bash
-npm install
-```
+El analizador utiliza la librería nativa de Python [Chepy](https://chepy.readthedocs.io/en/latest/usage.html) para identificar y desofuscar fragmentos Base64, URL-encoded y hexadecimales en el asunto y cuerpo del correo.
+- **100% Python nativo:** No requiere Node.js, npm ni procesos externos.
+- **Fallback resiliente:** Si `chepy` no estuviera instalado en un entorno aislado, el analizador degrada automáticamente a decodificación nativa con librerías estándar de Python (`base64`, `binascii`, `urllib.parse`).
+- No requiere API key ni transmite datos a Internet.
 
 La desofuscación se ejecuta por defecto al analizar un EML. Para omitirla:
 
 ```bash
-python analizador.py caso_grupo_1_paqueteria.eml --no-cyberchef
+python3 analizador.py caso_grupo_1_paqueteria.eml --no-deobfuscation
 ```
-
-Si Node 24 no está en el `PATH`, indica la ruta al ejecutable mediante `--cyberchef-node` o la variable `CYBERCHEF_NODE`.
+*(Nota: `--no-cyberchef` sigue funcionando como alias retrocompatible).*
 
 ---
 
@@ -49,7 +45,7 @@ WHOIS_API_KEY="tu_api_key"
 
 También puedes definir estas variables en el entorno del proceso. VirusTotal conserva el argumento opcional `--vt-key`.
 
-Las URLs se envían a urlscan.io con visibilidad **unlisted**; no aparecen en la búsqueda pública, aunque pueden ser visibles para investigadores y organizaciones con acceso a urlscan Pro. El programa espera hasta 30 segundos por cada tanda de resultados de urlscan; si siguen procesándose, muestra el estado pendiente y el enlace al informe. crt.sh consulta públicamente los certificados del dominio y sus subdominios. Si falta una clave de API, se informa el análisis omitido y el resto del reporte continúa.
+Las URLs se envían a urlscan.io con visibilidad **public** por defecto (compatible con cuentas gratuitas, o configurable con la variable de entorno `URLSCAN_VISIBILITY=unlisted`). El programa espera hasta 30 segundos por cada tanda de resultados de urlscan; si siguen procesándose, muestra el estado pendiente y el enlace al informe. crt.sh consulta públicamente los certificados del dominio y sus subdominios. Si falta una clave de API, se informa el análisis omitido y el resto del reporte continúa.
 
 ---
 

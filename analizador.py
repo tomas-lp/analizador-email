@@ -16,15 +16,18 @@ import urllib.error
 import urllib.parse
 import json
 import base64
+import binascii
 import ipaddress
 import subprocess
 import hashlib
 import mimetypes
 import zipfile
 from datetime import datetime
-from dotenv import load_dotenv
-
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 try:
     from rich.console import Console
@@ -54,8 +57,12 @@ EXECUTIVE_KEYWORDS = [
     "tesoreria", "recursos humanos", "rrhh", "soporte", "seguridad"
 ]
 
-CYBERCHEF_MAX_CANDIDATES = 8
-CYBERCHEF_MAX_INPUT_CHARS = 16_000
+DEOBFUSCATION_MAX_CANDIDATES = 8
+DEOBFUSCATION_MAX_INPUT_CHARS = 16_000
+
+# Aliases de retrocompatibilidad
+CYBERCHEF_MAX_CANDIDATES = DEOBFUSCATION_MAX_CANDIDATES
+CYBERCHEF_MAX_INPUT_CHARS = DEOBFUSCATION_MAX_INPUT_CHARS
 
 
 def extract_obfuscated_candidates(text: str) -> List[str]:
@@ -74,80 +81,168 @@ def extract_obfuscated_candidates(text: str) -> List[str]:
             candidate = match.group(0).strip()
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
-                if len(candidates) >= CYBERCHEF_MAX_CANDIDATES:
+                if len(candidates) >= DEOBFUSCATION_MAX_CANDIDATES:
                     return candidates
     return candidates
 
 
-def analyze_obfuscation_with_cyberchef(
-    text: str,
-    node_command: str = "node",
-    depth: int = 3,
-) -> List[Dict[str, Any]]:
-    """Ejecuta CyberChef Magic localmente sobre posibles fragmentos ofuscados.
-
-    No realiza solicitudes de red ni necesita credenciales. CyberChef se ejecuta
-    como proceso hijo de Node.js y recibe solo los candidatos detectados.
+def _decode_candidate_with_chepy(candidate: str) -> Optional[Tuple[str, str]]:
+    """Intenta decodificar un fragmento usando la librería Chepy.
+    
+    Devuelve (texto_decodificado, metodo_usado) o None si no aplica.
     """
-    bridge_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cyberchef_bridge.mjs")
+    try:
+        from chepy import Chepy
+    except ImportError:
+        return None
+
+    # 1. Probar URL decode si contiene secuencias percent-encoded
+    if "%" in candidate:
+        try:
+            res = Chepy(candidate).url_decode().o
+            if isinstance(res, bytes):
+                res = res.decode("utf-8", errors="replace")
+            if res and res != candidate:
+                return str(res), "Chepy (URL Decode)"
+        except Exception:
+            pass
+
+    # 2. Probar Hexadecimal si coincide con formato hex
+    clean_hex = re.sub(r"[\s:]", "", candidate)
+    if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
+        try:
+            res = Chepy(clean_hex).from_hex().o
+            if isinstance(res, bytes):
+                res = res.decode("utf-8", errors="replace")
+            if res and any(c.isprintable() for c in res):
+                return str(res), "Chepy (Hex)"
+        except Exception:
+            pass
+
+    # 3. Probar Base64 estándar
+    try:
+        res = Chepy(candidate).from_base64().o
+        if isinstance(res, bytes):
+            res = res.decode("utf-8", errors="replace")
+        if res and any(c.isprintable() for c in res):
+            return str(res), "Chepy (Base64)"
+    except Exception:
+        pass
+
+    # 4. Probar Base64 URL-safe si contiene caracteres de urlsafe
+    if "-" in candidate or "_" in candidate:
+        try:
+            res = Chepy(candidate).from_base64(alphabet="url_safe").o
+            if isinstance(res, bytes):
+                res = res.decode("utf-8", errors="replace")
+            if res and any(c.isprintable() for c in res):
+                return str(res), "Chepy (Base64 URL-safe)"
+        except Exception:
+            pass
+
+    return None
+
+
+def _decode_candidate_native(candidate: str) -> Optional[Tuple[str, str]]:
+    """Fallback nativo en Python estándar sin dependencias externas.
+    
+    Devuelve (texto_decodificado, metodo_usado) o None si no se puede decodificar.
+    """
+    # 1. Probar URL decode
+    if "%" in candidate:
+        try:
+            decoded = urllib.parse.unquote(candidate)
+            if decoded and decoded != candidate:
+                return decoded, "Python nativo (URL Decode)"
+        except Exception:
+            pass
+
+    # 2. Probar Hexadecimal
+    clean_hex = re.sub(r"[\s:]", "", candidate)
+    if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
+        try:
+            raw = binascii.unhexlify(clean_hex)
+            decoded = raw.decode("utf-8", errors="replace")
+            if decoded and any(c.isprintable() for c in decoded):
+                return decoded, "Python nativo (Hex)"
+        except Exception:
+            pass
+
+    # 3. Probar Base64 y Base64 URL-safe
+    s = candidate.strip()
+    s_std = s.replace("-", "+").replace("_", "/")
+    padding = len(s_std) % 4
+    if padding:
+        s_std += "=" * (4 - padding)
+
+    try:
+        raw = base64.b64decode(s_std, validate=False)
+        decoded = raw.decode("utf-8", errors="replace")
+        if decoded and any(c.isprintable() for c in decoded):
+            return decoded, "Python nativo (Base64)"
+    except Exception:
+        pass
+
+    return None
+
+
+def analyze_obfuscation(text: str, depth: int = 3) -> List[Dict[str, Any]]:
+    """Analiza y desofusca fragmentos sospechosos con Chepy o fallback nativo.
+    
+    Ejecución 100% en Python, sin llamadas externas a Node.js ni subprocesos.
+    """
     candidates = extract_obfuscated_candidates(text)
     if not candidates:
         return []
 
     results = []
     for candidate in candidates:
-        if len(candidate) > CYBERCHEF_MAX_INPUT_CHARS:
+        if len(candidate) > DEOBFUSCATION_MAX_INPUT_CHARS:
             results.append({
                 "input": candidate[:120] + "...",
                 "status": "skipped",
-                "message": f"Fragmento omitido: supera {CYBERCHEF_MAX_INPUT_CHARS} caracteres.",
-            })
-            continue
-        try:
-            completed = subprocess.run(
-                [node_command, bridge_path],
-                input=json.dumps({"input": candidate, "depth": depth}),
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-        except FileNotFoundError:
-            return [{
-                "status": "unavailable",
-                "message": "CyberChef requiere Node.js 24 y las dependencias de npm instaladas.",
-            }]
-        except subprocess.TimeoutExpired:
-            results.append({
-                "input": candidate[:120] + "...",
-                "status": "error",
-                "message": "CyberChef excedió el límite de 20 segundos para este fragmento.",
+                "message": f"Fragmento omitido: supera {DEOBFUSCATION_MAX_INPUT_CHARS} caracteres.",
             })
             continue
 
-        if completed.returncode != 0:
-            results.append({
-                "input": candidate[:120] + "...",
-                "status": "error",
-                "message": (completed.stderr or "CyberChef no pudo procesar el fragmento.").strip(),
-            })
-            continue
-
-        try:
-            payload = json.loads(completed.stdout)
+        # Intentar primero con Chepy
+        chepy_res = _decode_candidate_with_chepy(candidate)
+        if chepy_res:
+            decoded, method = chepy_res
             results.append({
                 "input": candidate,
                 "status": "success",
-                "output": payload.get("output", ""),
-                "type": payload.get("type", "string"),
+                "output": decoded,
+                "engine": method,
+                "type": "string",
             })
-        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Fallback nativo de Python
+        native_res = _decode_candidate_native(candidate)
+        if native_res:
+            decoded, method = native_res
             results.append({
-                "input": candidate[:120] + "...",
-                "status": "error",
-                "message": "CyberChef devolvió una respuesta local inválida.",
+                "input": candidate,
+                "status": "success",
+                "output": decoded,
+                "engine": method,
+                "type": "string",
             })
+            continue
+
+        results.append({
+            "input": candidate[:120] + ("..." if len(candidate) > 120 else ""),
+            "status": "unresolved",
+            "message": "No se pudo inferir una desofuscación válida para este fragmento.",
+        })
+
     return results
+
+
+def analyze_obfuscation_with_cyberchef(text: str, node_command: str = "node", depth: int = 3) -> List[Dict[str, Any]]:
+    """Alias retrocompatible con la API anterior que redirige a analyze_obfuscation."""
+    return analyze_obfuscation(text, depth=depth)
 
 
 def extract_links_from_html(html_content: str) -> List[str]:
@@ -724,9 +819,10 @@ def get_http_error_detail(error: urllib.error.HTTPError, fallback: str) -> str:
 
 
 def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
-    """Envía una URL a urlscan.io con visibilidad unlisted."""
+    """Envía una URL a urlscan.io con visibilidad configurable (public por defecto)."""
     api_url = "https://urlscan.io/api/v1/scan/"
-    payload = json.dumps({"url": url, "visibility": "unlisted"}).encode()
+    visibility = os.environ.get("URLSCAN_VISIBILITY", "public").strip()
+    payload = json.dumps({"url": url, "visibility": visibility}).encode()
     req = urllib.request.Request(api_url, data=payload, headers={
         "API-Key": api_key,
         "Content-Type": "application/json",
@@ -745,7 +841,7 @@ def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
                 "target": url,
                 "provider": "urlscan",
                 "status": "submitted",
-                "visibility": "unlisted",
+                "visibility": visibility,
                 "scan_id": scan_id,
                 "result_url": data.get("result") or (
                     f"https://urlscan.io/result/{scan_id}/" if scan_id else ""
@@ -978,7 +1074,8 @@ def analyze_links_with_intel(
 
     results = []
     if urlscan_api_key:
-        console.print(f"[bold cyan]🔍 Enviando {len(urls)} URL(s) a urlscan (visibilidad unlisted)...[/bold cyan]")
+        visibility = os.environ.get("URLSCAN_VISIBILITY", "public").strip()
+        console.print(f"[bold cyan]🔍 Enviando {len(urls)} URL(s) a urlscan (visibilidad {visibility})...[/bold cyan]")
         for url in urls:
             results.append(urlscan_submit_url(url, urlscan_api_key))
         urlscan_wait_for_results(results, urlscan_api_key)
@@ -1386,35 +1483,36 @@ def render_eml_analysis(
             border_style="dim blue"
         ))
 
-    # 5. Desofuscación local con CyberChef Magic
+    # 5. Desofuscación de Contenido (Chepy / Local)
     if cyberchef_results:
-        cyberchef_lines = []
+        deobf_lines = []
         for result in cyberchef_results:
             status = result.get("status")
             if status == "success":
                 original = result.get("input", "")
                 decoded = result.get("output", "")
+                engine = result.get("engine", "Chepy / Local")
                 if len(original) > 180:
                     original = original[:177] + "..."
                 if len(decoded) > 1_000:
                     decoded = decoded[:997] + "..."
-                cyberchef_lines.append(
+                deobf_lines.append(
                     f"[bold cyan]Entrada detectada:[/bold cyan] {original}\n"
-                    f"[bold green]Resultado Magic:[/bold green] {decoded}"
+                    f"[bold green]Resultado ({engine}):[/bold green] {decoded}"
                 )
             elif status == "unavailable":
-                cyberchef_lines.append(f"[yellow]⚠️ {result.get('message', '')}[/yellow]")
+                deobf_lines.append(f"[yellow]⚠️ {result.get('message', '')}[/yellow]")
             else:
-                cyberchef_lines.append(f"[yellow]⚠️ {result.get('message', 'Fragmento omitido.')}[/yellow]")
+                deobf_lines.append(f"[yellow]⚠️ {result.get('message', 'Fragmento omitido.')}[/yellow]")
         console.print(Panel(
-            "\n\n".join(cyberchef_lines),
-            title="[bold]🧪 Desofuscación local con CyberChef Magic[/bold]",
+            "\n\n".join(deobf_lines),
+            title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
             border_style="green",
         ))
     else:
         console.print(Panel(
             "[dim]No se detectaron fragmentos Base64, URL-encoded o hexadecimales para procesar.[/dim]",
-            title="[bold]🧪 Desofuscación local con CyberChef Magic[/bold]",
+            title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
             border_style="dim green",
         ))
 
@@ -1724,8 +1822,7 @@ def main():
     parser.add_argument("--url", "--link", dest="url", default=None, help="URL o dominio a analizar")
     parser.add_argument("--file", dest="file_path", default=None, help="Archivo local para calcular hashes y metadatos")
     parser.add_argument("--vt-key", "--api-key", dest="vt_key", default=None, help="API Key de VirusTotal (o usar variable VIRUSTOTAL_API_KEY)")
-    parser.add_argument("--no-cyberchef", action="store_true", help="No ejecutar la desofuscación local con CyberChef Magic")
-    parser.add_argument("--cyberchef-node", default=os.environ.get("CYBERCHEF_NODE", "node"), help="Ejecutable Node.js 24 para CyberChef (por defecto: node)")
+    parser.add_argument("--no-deobfuscation", "--no-cyberchef", dest="no_deobfuscation", action="store_true", help="No ejecutar la desofuscación local de fragmentos")
     args = parser.parse_args()
 
     selected_inputs = sum(bool(value) for value in (args.archivo_eml, args.url, args.file_path))
@@ -1751,9 +1848,8 @@ def main():
             data = parse_eml_file(target_file)
             vt_results = analyze_iocs_with_virustotal(data, vt_key)
             url_intel_results = analyze_links_with_intel(data, urlscan_key, whois_key)
-            cyberchef_results = [] if args.no_cyberchef else analyze_obfuscation_with_cyberchef(
-                f"{data.get('subject', '')}\n{data.get('body', '')}",
-                node_command=args.cyberchef_node,
+            cyberchef_results = [] if args.no_deobfuscation else analyze_obfuscation(
+                f"{data.get('subject', '')}\n{data.get('body', '')}"
             )
             render_eml_analysis(
                 data,
