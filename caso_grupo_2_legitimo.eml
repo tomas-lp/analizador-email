@@ -1,0 +1,23 @@
+Delivered-To: usuario2@correo-personal.example
+Received: from mail-out.tienda-real.example (mail-out.tienda-real.example. [203.0.113.10])
+        by mx.correo-personal.example with ESMTPS id c3d4
+        for <usuario2@correo-personal.example>;
+        Fri, 02 Oct 2026 10:15:44 -0300 (ART)
+Authentication-Results: mx.correo-personal.example;
+        spf=pass smtp.mailfrom=no-reply@tienda-real.example;
+        dkim=pass header.d=tienda-real.example;
+        dmarc=pass (p=quarantine) header.from=tienda-real.example
+From: "Tienda Real" <no-reply@tienda-real.example>
+Reply-To: soporte@tienda-real.example
+Return-Path: <bounce@tienda-real.example>
+To: usuario2@correo-personal.example
+Subject: =?UTF-8?B?Q29uZmlybWFjaW9uIGRlIHR1IGNvbXByYSAjNDgyMTM=?=
+Date: Fri, 02 Oct 2026 10:15:40 -0300
+Message-ID: <48213@tienda-real.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+
+<html><body>
+<p>Gracias por tu compra. Podes ver el detalle en tu cuenta:</p>
+<p><a href="https://tienda-real.example/mis-pedidos/48213">Ver mi pedido</a></p>
+</body></html>

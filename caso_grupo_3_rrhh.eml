@@ -1,0 +1,24 @@
+Delivered-To: empleado3@empresa-cliente.example
+Received: from smtp.correo-masivo.example (smtp.correo-masivo.example. [192.0.2.88])
+        by mx.empresa-cliente.example with ESMTPS id e5f6
+        for <empleado3@empresa-cliente.example>;
+        Fri, 02 Oct 2026 11:40:03 -0300 (ART)
+Authentication-Results: mx.empresa-cliente.example;
+        spf=pass smtp.mailfrom=envios@correo-masivo.example;
+        dkim=pass header.d=correo-masivo.example;
+        dmarc=fail (p=none) header.from=empresa-cliente.example
+From: "Recursos Humanos" <rrhh@empresa-cliente.example>
+Reply-To: liquidacion.sueldos@rrhh-portal.example
+Return-Path: <bounce@correo-masivo.example>
+To: empleado3@empresa-cliente.example
+Subject: =?UTF-8?B?UmVjaWJvIGRlIHN1ZWxkbyAtIGFjY2lvbiByZXF1ZXJpZGEgYW50ZXMgZGUgbGFzIDE4OjAw?=
+Date: Fri, 02 Oct 2026 11:40:00 -0300
+Message-ID: <rh2026@correo-masivo.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+
+<html><body>
+<p>Actualizamos el sistema de liquidacion. Verifica tu CBU para cobrar:</p>
+<p><a href="https://rrhh-portal.example/verificar-cbu">Actualizar mis datos bancarios</a></p>
+<p>Departamento de RRHH</p>
+</body></html>

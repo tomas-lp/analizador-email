@@ -1,0 +1,24 @@
+Delivered-To: tesoreria5@empresa-cliente.example
+Received: from mail.gm-x.example (mail.gm-x.example. [198.51.100.240])
+        by mx.empresa-cliente.example with ESMTPS id i9j0
+        for <tesoreria5@empresa-cliente.example>;
+        Fri, 02 Oct 2026 13:22:47 -0300 (ART)
+Authentication-Results: mx.empresa-cliente.example;
+        spf=pass smtp.mailfrom=gerencia.general2026@gm-x.example;
+        dkim=pass header.d=gm-x.example;
+        dmarc=pass header.from=gm-x.example
+From: "Ricardo Gomez (Gerencia)" <gerencia.general2026@gm-x.example>
+Reply-To: gerencia.general2026@gm-x.example
+Return-Path: <gerencia.general2026@gm-x.example>
+To: tesoreria5@empresa-cliente.example
+Subject: =?UTF-8?B?VHJhbnNmZXJlbmNpYSB1cmdlbnRlIC0gY29uZmlkZW5jaWFs?=
+Date: Fri, 02 Oct 2026 13:22:45 -0300
+Message-ID: <bec2026@gm-x.example>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+
+Estoy en una reunion y no puedo hablar por telefono.
+Necesito que hagas una transferencia de $4.800.000 a un proveedor nuevo,
+hoy antes de las 15:00. Te paso el CBU por este medio. Es confidencial,
+no lo comentes con nadie del equipo todavia.
+Gracias, Ricardo.

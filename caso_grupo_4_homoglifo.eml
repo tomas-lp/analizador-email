@@ -1,0 +1,23 @@
+Delivered-To: usuario4@correo-personal.example
+Received: from vps-1102.hostbarato.example (vps-1102.hostbarato.example. [203.0.113.202])
+        by mx.correo-personal.example with ESMTPS id g7h8
+        for <usuario4@correo-personal.example>;
+        Fri, 02 Oct 2026 12:05:19 -0300 (ART)
+Authentication-Results: mx.correo-personal.example;
+        spf=fail smtp.mailfrom=alerta@xn--bnco-ejemplo-thb.example;
+        dkim=none;
+        dmarc=fail header.from=xn--bnco-ejemplo-thb.example
+From: "Bаnco Ejemplo" <alerta@xn--bnco-ejemplo-thb.example>
+Reply-To: alerta@xn--bnco-ejemplo-thb.example
+Return-Path: <bounce@vps-1102.hostbarato.example>
+To: usuario4@correo-personal.example
+Subject: =?UTF-8?B?QmxvcXVlbyB0ZW1wb3JhbCBkZSBzdSBob21lIGJhbmtpbmc=?=
+Date: Fri, 02 Oct 2026 12:05:15 -0300
+Message-ID: <hb2026@vps-1102.hostbarato.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+
+<html><body>
+<p>Su acceso fue bloqueado. Desbloquee ahora:</p>
+<p><a href="https://xn--bnco-ejemplo-thb.example/login">Desbloquear cuenta</a></p>
+</body></html>

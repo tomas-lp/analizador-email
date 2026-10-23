@@ -1,0 +1,24 @@
+Delivered-To: usuario1@correo-personal.example
+Received: from mail.envios-correo.example (mail.envios-correo.example. [198.51.100.23])
+        by mx.correo-personal.example with ESMTPS id a1b2
+        for <usuario1@correo-personal.example>;
+        Fri, 02 Oct 2026 09:02:10 -0300 (ART)
+Authentication-Results: mx.correo-personal.example;
+        spf=softfail smtp.mailfrom=aviso@correos-encomiendas.example;
+        dkim=none;
+        dmarc=fail (p=none) header.from=correos-encomiendas.example
+From: "Correo Encomiendas" <aviso@correos-encomiendas.example>
+Reply-To: gestion@pago-aduana.example
+Return-Path: <bounce@mail.envios-correo.example>
+To: usuario1@correo-personal.example
+Subject: =?UTF-8?B?U3UgcGFxdWV0ZSBlc3RhIHJldGVuaWRvIC0gYWJvbmUgJDIuMzAwIGRlIGFkdWFuYQ==?=
+Date: Fri, 02 Oct 2026 09:02:08 -0300
+Message-ID: <2026x1@mail.envios-correo.example>
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+
+<html><body>
+<p>Su envio 8842-AR esta retenido. Abone la tasa antes de 48hs:</p>
+<p><a href="https://bit.ly/paq-ar-8842">Pagar tasa de aduana</a></p>
+<p>Servicio de Encomiendas</p>
+</body></html>
