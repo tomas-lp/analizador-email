@@ -16,10 +16,18 @@ import urllib.error
 import urllib.parse
 import json
 import base64
+import binascii
 import ipaddress
-from dotenv import load_dotenv
-
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+import subprocess
+import hashlib
+import mimetypes
+import zipfile
+from datetime import datetime
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 try:
     from rich.console import Console
@@ -48,6 +56,385 @@ EXECUTIVE_KEYWORDS = [
     "gerencia", "director", "ceo", "presidente", "finanzas", 
     "tesoreria", "recursos humanos", "rrhh", "soporte", "seguridad"
 ]
+
+DEOBFUSCATION_MAX_CANDIDATES = 8
+DEOBFUSCATION_MAX_INPUT_CHARS = 16_000
+
+# Aliases de retrocompatibilidad
+CYBERCHEF_MAX_CANDIDATES = DEOBFUSCATION_MAX_CANDIDATES
+CYBERCHEF_MAX_INPUT_CHARS = DEOBFUSCATION_MAX_INPUT_CHARS
+
+
+def extract_obfuscated_candidates(text: str) -> List[str]:
+    """Extrae fragmentos que pueden contener codificación u ofuscación común."""
+    candidates = []
+    patterns = [
+        # Base64 y Base64 URL-safe: se evita texto breve para reducir falsos positivos.
+        r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])",
+        # Secuencias URL percent-encoded.
+        r"(?:%[0-9A-Fa-f]{2}){3,}",
+        # Hexadecimal, con o sin espacios entre bytes.
+        r"(?<![%0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\s:]?){8,}(?![0-9A-Fa-f])",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            candidate = match.group(0).strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+                if len(candidates) >= DEOBFUSCATION_MAX_CANDIDATES:
+                    return candidates
+    return candidates
+
+
+def is_meaningful_text(text: str) -> bool:
+    """Verifica si un texto decodificado tiene suficiente estructura y legibilidad para ser considerado texto real."""
+    if not text or len(text.strip()) < 4:
+        return False
+    printable_count = sum(1 for c in text if c.isprintable() or c in "\r\n\t ")
+    ratio = printable_count / len(text)
+    if ratio < 0.80:
+        return False
+    if text.count("\ufffd") > max(2, len(text) * 0.05) or "\x00" in text:
+        return False
+    return True
+
+
+SCRIPT_EXECUTION_PATTERNS = [
+    r"\bpowershell(?:\.exe)?\b",
+    r"\bcmd(?:\.exe)?\b",
+    r"\b(?:iex|invoke-expression)\b",
+    r"\b(?:downloadstring|downloadfile)\b",
+    r"\b(?:certutil|bitsadmin|mshta|cscript|wscript)\b",
+    r"\b(?:bash|sh)\s+-i\b",
+    r"\b(?:curl|wget)\s+.*\|\s*(?:sh|bash)\b",
+    r"\b(?:eval|unescape)\s*\(",
+    r"\bExecutionPolicy\s+Bypass\b",
+]
+
+SOCIAL_ENGINEERING_KEYWORDS = [
+    r"\b(?:urgente|bloqueo|suspension|inmediato|verificar|confirmar|cuenta|banco|tarjeta|factura|pago|transferencia|clave|credenciales)\b",
+    r"\b(?:urgent|suspend|immediate|verify|confirm|account|bank|invoice|payment|wire|transfer|password|credential|gift|reward|prize)\b",
+]
+
+
+def classify_and_verify_payload(
+    raw_bytes: bytes,
+    decoded_text: str,
+    candidate: str,
+    method: str,
+) -> Dict[str, Any]:
+    """Clasifica, valida y genera la interpretación forense de un artefacto desofuscado."""
+    # 1. Validación de Payloads Binarios (Magic Bytes)
+    if raw_bytes.startswith(b"MZ"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Ejecutable Windows (PE / EXE / DLL)",
+            "extracted_content": f"Binario ejecutable Portable Executable (MZ) — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Se detectó un archivo ejecutable de Windows oculto en formato Base64. Indica intento directo de entrega de malware (Dropper).",
+            "threat_type": "Dropper / Malware Binario Embebido (MITRE T1027)",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Aislar la muestra, no ejecutar, extraer el binario únicamente en sandbox cerrada y bloquear el hash en EDR.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"PK\x03\x04"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Archivo Comprimido (ZIP / Office)",
+            "extracted_content": f"Contenedor comprimido ZIP / Documento Office — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Se detectó un contenedor ZIP o documento Office comprimido en Base64. Usado frecuentemente para evadir inspección de adjuntos.",
+            "threat_type": "Contenedor Comprimido / Documento Trampa (MITRE T1027)",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Inspeccionar el contenido del archivo en entorno aislado para buscar macros o scripts.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"%PDF"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Documento PDF Embebido",
+            "extracted_content": f"Documento PDF embebido — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Documento PDF codificado en el cuerpo. Puede contener enlaces de phishing o exploits dirigidos.",
+            "threat_type": "Documento Trampa (PDF)",
+            "cia_impact": "Pérdida de Confidencialidad",
+            "verdict": "SOSPECHOSO",
+            "confidence": "Alta",
+            "recommendation": "Analizar enlaces internos y streams del PDF con herramientas de análisis de documentos.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"\x7fELF"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Binario Ejecutable Linux (ELF)",
+            "extracted_content": f"Binario ejecutable Linux ELF — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Binario ejecutable para entornos Linux/Unix codificado en Base64.",
+            "threat_type": "Malware para Linux / Dropper",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Bloquear hash en firewall perimetral y analizar en sandbox aislada.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    # 2. Validación de Scripts y Comandos Maliciosos
+    for pat in SCRIPT_EXECUTION_PATTERNS:
+        if re.search(pat, decoded_text, re.IGNORECASE):
+            return {
+                "input": candidate,
+                "method": method,
+                "status": "success",
+                "category": "MALICIOUS_SCRIPT",
+                "label": "Script / Comando de Consola",
+                "extracted_content": decoded_text.strip(),
+                "forensic_interpretation": "El atacante ofuscó un comando del sistema para ejecutar código sin alertar a los motores antivirus perimetrales.",
+                "threat_type": "Comando de Consola / Living-off-the-Land (MITRE T1059)",
+                "cia_impact": "Pérdida de Integridad y Disponibilidad (Control del sistema)",
+                "verdict": "MALICIOSO",
+                "confidence": "Alta",
+                "recommendation": "Bloquear ejecución de scripts en endpoints (PowerShell CLM / AppLocker) y revisar registros Sysmon.",
+                "is_malicious": True,
+                "is_noise": False,
+            }
+
+    # 3. Validación de URLs Ocultas / Phishing
+    hidden_urls = extract_links_from_text(decoded_text)
+    if hidden_urls:
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "HIDDEN_URL",
+            "label": "Enlace Oculto (URL Phishing)",
+            "extracted_content": ", ".join(hidden_urls),
+            "forensic_interpretation": "El correo ocultó una URL en Base64/Hex para impedir que la pasarela de seguridad o el filtro antispam inspeccione el destino de la redirección.",
+            "threat_type": "Evasión de Filtro Antispam / Phishing Encubierto (MITRE T1027)",
+            "cia_impact": "Pérdida de Confidencialidad (Robo de credenciales / Suplantación)",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Bloquear la URL y su dominio en el proxy/firewall y concientizar a los usuarios.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    # 4. Validación de Texto Legible / Ingeniería Social
+    if is_meaningful_text(decoded_text):
+        for pat in SOCIAL_ENGINEERING_KEYWORDS:
+            if re.search(pat, decoded_text, re.IGNORECASE):
+                return {
+                    "input": candidate,
+                    "method": method,
+                    "status": "success",
+                    "category": "SOCIAL_ENG_TEXT",
+                    "label": "Ingeniería Social Encubierta",
+                    "extracted_content": decoded_text.strip(),
+                    "forensic_interpretation": "Texto del señuelo ofuscado con palabras clave para sortear los filtros antispam semánticos.",
+                    "threat_type": "Evasión de Filtro de Contenido por Palabras Clave",
+                    "cia_impact": "Pérdida de Confidencialidad (Engaño al usuario)",
+                    "verdict": "SOSPECHOSO",
+                    "confidence": "Media",
+                    "recommendation": "Concientizar a los usuarios sobre correos con contenido codificado o no estándar.",
+                    "is_malicious": False,
+                    "is_noise": False,
+                }
+
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "READABLE_TEXT",
+            "label": "Texto Plano Codificado",
+            "extracted_content": decoded_text.strip(),
+            "forensic_interpretation": "Texto legible decodificado sin comandos ejecutables ni enlaces evidentes.",
+            "threat_type": "Contenido Codificado General",
+            "cia_impact": "N/A",
+            "verdict": "INOCUO",
+            "confidence": "Media",
+            "recommendation": "Revisar contexto del remitente.",
+            "is_malicious": False,
+            "is_noise": False,
+        }
+
+    # 5. Si no es legible ni contiene magic bytes: Token de Telemetría / Inocuo
+    return {
+        "input": candidate,
+        "method": method,
+        "status": "success",
+        "category": "TRACKING_TOKEN",
+        "label": "Token de Telemetría / Rastreo",
+        "extracted_content": f"[Hash/ID de telemetría de {len(raw_bytes)} bytes]",
+        "forensic_interpretation": "Parámetro aleatorio o hash de seguimiento de clics de la plataforma; no contiene código malicioso ni enlaces ocultos.",
+        "threat_type": "Identificador de Campaña / Telemetría (Inocuo)",
+        "cia_impact": "Ninguno",
+        "verdict": "INOCUO",
+        "confidence": "Alta",
+        "recommendation": "No requiere acción técnica adicional.",
+        "is_malicious": False,
+        "is_noise": True,
+    }
+
+
+def _decode_candidate_raw(candidate: str) -> Optional[Tuple[bytes, str, str]]:
+    """Intenta decodificar un fragmento devolviendo (raw_bytes, decoded_text, method)."""
+    # Intentar con Chepy si está disponible
+    try:
+        from chepy import Chepy
+        if "%" in candidate:
+            try:
+                res = Chepy(candidate).url_decode().o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                if text and text != candidate:
+                    return raw, text, "Chepy (URL Decode)"
+            except Exception:
+                pass
+
+        clean_hex = re.sub(r"[\s:]", "", candidate)
+        if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
+            try:
+                res = Chepy(clean_hex).from_hex().o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                return raw, text, "Chepy (Hex)"
+            except Exception:
+                pass
+
+        try:
+            res = Chepy(candidate).from_base64().o
+            raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+            text = raw.decode("utf-8", errors="replace")
+            return raw, text, "Chepy (Base64)"
+        except Exception:
+            pass
+
+        if "-" in candidate or "_" in candidate:
+            try:
+                res = Chepy(candidate).from_base64(alphabet="url_safe").o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                return raw, text, "Chepy (Base64 URL-safe)"
+            except Exception:
+                pass
+    except ImportError:
+        pass
+
+    # Fallback nativo de Python
+    if "%" in candidate:
+        try:
+            decoded = urllib.parse.unquote(candidate)
+            if decoded and decoded != candidate:
+                return decoded.encode("utf-8", errors="replace"), decoded, "Python nativo (URL Decode)"
+        except Exception:
+            pass
+
+    clean_hex = re.sub(r"[\s:]", "", candidate)
+    if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
+        try:
+            raw = binascii.unhexlify(clean_hex)
+            decoded = raw.decode("utf-8", errors="replace")
+            return raw, decoded, "Python nativo (Hex)"
+        except Exception:
+            pass
+
+    s = candidate.strip()
+    s_std = s.replace("-", "+").replace("_", "/")
+    padding = len(s_std) % 4
+    if padding:
+        s_std += "=" * (4 - padding)
+
+    try:
+        raw = base64.b64decode(s_std, validate=False)
+        decoded = raw.decode("utf-8", errors="replace")
+        return raw, decoded, "Python nativo (Base64)"
+    except Exception:
+        pass
+
+    return None
+
+
+def _decode_candidate_with_chepy(candidate: str) -> Optional[Tuple[str, str]]:
+    """Alias retrocompatible."""
+    res = _decode_candidate_raw(candidate)
+    return (res[1], res[2]) if res else None
+
+
+def _decode_candidate_native(candidate: str) -> Optional[Tuple[str, str]]:
+    """Alias retrocompatible."""
+    res = _decode_candidate_raw(candidate)
+    return (res[1], res[2]) if res else None
+
+
+def analyze_obfuscation(text: str, depth: int = 3) -> List[Dict[str, Any]]:
+    """Analiza, clasifica y valida fragmentos sospechosos con Chepy o fallback nativo.
+    
+    Genera fichas forenses completas con taxonomía de amenazas, intención e impacto C-I-A.
+    """
+    candidates = extract_obfuscated_candidates(text)
+    if not candidates:
+        return []
+
+    results = []
+    for candidate in candidates:
+        if len(candidate) > DEOBFUSCATION_MAX_INPUT_CHARS:
+            results.append({
+                "input": candidate[:120] + "...",
+                "status": "skipped",
+                "category": "TRACKING_TOKEN",
+                "label": "Fragmento Omitido",
+                "verdict": "INOCUO",
+                "forensic_interpretation": f"Fragmento omitido: supera {DEOBFUSCATION_MAX_INPUT_CHARS} caracteres.",
+                "message": f"Fragmento omitido: supera {DEOBFUSCATION_MAX_INPUT_CHARS} caracteres.",
+                "is_noise": True,
+                "is_malicious": False,
+            })
+            continue
+
+        decoded = _decode_candidate_raw(candidate)
+        if decoded:
+            raw_bytes, decoded_str, method = decoded
+            finding = classify_and_verify_payload(raw_bytes, decoded_str, candidate, method)
+            finding["output"] = finding["extracted_content"]
+            finding["engine"] = method
+            results.append(finding)
+        else:
+            results.append({
+                "input": candidate[:120] + ("..." if len(candidate) > 120 else ""),
+                "status": "unresolved",
+                "category": "TRACKING_TOKEN",
+                "label": "Cadena Opaca",
+                "verdict": "INOCUO",
+                "forensic_interpretation": "Cadena opaca; no contiene formato decodificable conocido.",
+                "message": "No se pudo inferir una desofuscación válida para este fragmento.",
+                "is_noise": True,
+                "is_malicious": False,
+            })
+
+    return results
+
+
+def analyze_obfuscation_with_cyberchef(text: str, node_command: str = "node", depth: int = 3) -> List[Dict[str, Any]]:
+    """Alias retrocompatible con la API anterior que redirige a analyze_obfuscation."""
+    return analyze_obfuscation(text, depth=depth)
 
 
 def extract_links_from_html(html_content: str) -> List[str]:
@@ -150,13 +537,15 @@ def parse_eml_file(filepath: str) -> Dict[str, Any]:
     _, to_email = parseaddr(to_header)
     to_domain = to_email.split("@")[-1].lower() if "@" in to_email else ""
 
-    # Extraer IP de origen de la cabecera Received más reciente
+    # Extraer IP de origen desde la cabecera Received más antigua (de abajo hacia arriba).
     source_ip = ""
     received_headers = msg.get_all("Received", [])
     if received_headers:
-        m_ip = re.search(r'\[([0-9a-fA-F:\.]+)\]', received_headers[0])
-        if m_ip:
-            source_ip = m_ip.group(1)
+        for received in reversed(received_headers):
+            m_ip = re.search(r'\[([0-9a-fA-F:\.]+)\]', received)
+            if m_ip:
+                source_ip = m_ip.group(1)
+                break
 
     # Extraer autenticación desde Authentication-Results
     auth_header = msg.get("Authentication-Results", "")
@@ -184,10 +573,23 @@ def parse_eml_file(filepath: str) -> Dict[str, Any]:
     # Extraer cuerpo, enlaces e IPs
     body_text = ""
     all_links = []
+    attachments = []
     
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
+            filename = part.get_filename()
+            if part.get_content_disposition() == "attachment" or filename:
+                try:
+                    payload = part.get_payload(decode=True) or b""
+                    attachments.append({
+                        "name": filename or "adjunto_sin_nombre",
+                        "content_type": ctype,
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    })
+                except (TypeError, ValueError):
+                    pass
             try:
                 content = part.get_content()
                 if isinstance(content, str):
@@ -259,6 +661,7 @@ def parse_eml_file(filepath: str) -> Dict[str, Any]:
         "dmarc_domain": auth_data["dmarc_domain"] or from_domain,
         "body": body_text.strip(),
         "links": clean_links,
+        "attachments": attachments,
     }
 
 
@@ -315,10 +718,10 @@ def vt_lookup_url(url: str, api_key: str) -> Dict[str, Any]:
         if e.code == 404:
             return vt_submit_url_scan(url, api_key)
         elif e.code == 401:
-            return {"target": url, "type": "URL", "status": "error", "message": "API Key inválida o no autorizada"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
         elif e.code == 429:
-            return {"target": url, "type": "URL", "status": "error", "message": "Cuota de VirusTotal excedida (Rate Limit)"}
-        return {"target": url, "type": "URL", "status": "error", "message": f"Error HTTP {e.code}"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "Cuota de VirusTotal excedida (Rate Limit)")}
+        return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "Error al consultar VirusTotal")}
     except Exception as e:
         return {"target": url, "type": "URL", "status": "error", "message": str(e)}
 
@@ -344,8 +747,8 @@ def vt_submit_url_scan(url: str, api_key: str) -> Dict[str, Any]:
             }
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return {"target": url, "type": "URL", "status": "error", "message": "API Key inválida o no autorizada"}
-        return {"target": url, "type": "URL", "status": "not_found", "message": f"Sin reporte previo (HTTP {e.code})"}
+            return {"target": url, "type": "URL", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
+        return {"target": url, "type": "URL", "status": "not_found", "message": get_http_error_detail(e, "Sin reporte previo en VirusTotal")}
     except Exception as e:
         return {"target": url, "type": "URL", "status": "not_found", "message": "Sin reporte previo en VirusTotal"}
 
@@ -393,21 +796,93 @@ def vt_lookup_ip(ip: str, api_key: str) -> Dict[str, Any]:
             }
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return {"target": ip, "type": "IP", "status": "not_found", "message": "Sin registros en VirusTotal"}
+            return {"target": ip, "type": "IP", "status": "not_found", "message": get_http_error_detail(e, "Sin registros en VirusTotal")}
         elif e.code == 401:
-            return {"target": ip, "type": "IP", "status": "error", "message": "API Key inválida o no autorizada"}
+            return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "API Key inválida o no autorizada")}
         elif e.code == 429:
-            return {"target": ip, "type": "IP", "status": "error", "message": "Cuota de VirusTotal excedida (Rate Limit)"}
-        return {"target": ip, "type": "IP", "status": "error", "message": f"Error HTTP {e.code}"}
+            return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "Cuota de VirusTotal excedida (Rate Limit)")}
+        return {"target": ip, "type": "IP", "status": "error", "message": get_http_error_detail(e, "Error al consultar VirusTotal")}
     except Exception as e:
         return {"target": ip, "type": "IP", "status": "error", "message": str(e)}
 
 
+def vt_lookup_domain(domain: str, api_key: str) -> Dict[str, Any]:
+    """Consulta la reputación pública de un dominio en VirusTotal."""
+    api_url = f"https://www.virustotal.com/api/v3/domains/{urllib.parse.quote(domain, safe='')}"
+    req = urllib.request.Request(api_url, headers={"x-apikey": api_key, "User-Agent": "Email-Auth-Analyzer/1.0"})
+    try:
+        with urllib.request.urlopen(req, context=get_ssl_context(), timeout=12) as response:
+            attrs = json.loads(response.read().decode()).get("data", {}).get("attributes", {})
+            stats = attrs.get("last_analysis_stats", {})
+            return {
+                "target": domain, "type": "DOMAIN", "status": "success",
+                "malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0),
+                "harmless": stats.get("harmless", 0), "reputation": attrs.get("reputation", 0),
+                "categories": list(attrs.get("categories", {}).values())[:2],
+            }
+    except urllib.error.HTTPError as error:
+        message = "Dominio sin reporte previo" if error.code == 404 else "Error al consultar VirusTotal"
+        message = get_http_error_detail(error, message)
+        return {"target": domain, "type": "DOMAIN", "status": "not_found" if error.code == 404 else "error", "message": message}
+    except Exception as error:
+        return {"target": domain, "type": "DOMAIN", "status": "error", "message": str(error)}
+
+
+def vt_lookup_file_hash(sha256: str, api_key: str) -> Dict[str, Any]:
+    """Consulta un hash conocido sin cargar ni ejecutar el archivo local."""
+    api_url = f"https://www.virustotal.com/api/v3/files/{urllib.parse.quote(sha256, safe='')}"
+    req = urllib.request.Request(api_url, headers={"x-apikey": api_key, "User-Agent": "Email-Auth-Analyzer/1.0"})
+    try:
+        with urllib.request.urlopen(req, context=get_ssl_context(), timeout=12) as response:
+            attrs = json.loads(response.read().decode()).get("data", {}).get("attributes", {})
+            stats = attrs.get("last_analysis_stats", {})
+            return {
+                "target": sha256, "type": "FILE", "status": "success",
+                "malicious": stats.get("malicious", 0), "suspicious": stats.get("suspicious", 0),
+                "harmless": stats.get("harmless", 0), "undetected": stats.get("undetected", 0),
+                "reputation": attrs.get("reputation", 0), "type_description": attrs.get("type_description", ""),
+                "meaningful_name": attrs.get("meaningful_name", ""),
+            }
+    except urllib.error.HTTPError as error:
+        message = "Hash sin reporte previo; el archivo no fue subido." if error.code == 404 else "Error al consultar VirusTotal"
+        message = get_http_error_detail(error, message)
+        return {"target": sha256, "type": "FILE", "status": "not_found" if error.code == 404 else "error", "message": message}
+    except Exception as error:
+        return {"target": sha256, "type": "FILE", "status": "error", "message": str(error)}
+
+
+def vt_lookup_file_behavior(sha256: str, api_key: str) -> Dict[str, Any]:
+    """Recupera comportamiento de sandbox existente en VT sin enviar el archivo."""
+    api_url = f"https://www.virustotal.com/api/v3/files/{urllib.parse.quote(sha256, safe='')}/behaviours?limit=1"
+    req = urllib.request.Request(api_url, headers={"x-apikey": api_key, "User-Agent": "Email-Auth-Analyzer/1.0"})
+    try:
+        with urllib.request.urlopen(req, context=get_ssl_context(), timeout=12) as response:
+            behaviours = json.loads(response.read().decode()).get("data", [])
+            if not behaviours:
+                return {"status": "not_found", "message": "No hay comportamiento sandbox disponible para este hash."}
+            attributes = behaviours[0].get("attributes", {})
+            return {
+                "status": "success",
+                "sandbox": attributes.get("sandbox_name") or attributes.get("sandbox_type") or "VirusTotal",
+                "verdict": attributes.get("verdict") or "N/D",
+                "processes": len(attributes.get("processes", []) or []),
+                "network": len(attributes.get("network_connections", []) or []),
+            }
+    except urllib.error.HTTPError as error:
+        message = "No hay comportamiento sandbox disponible para este hash." if error.code == 404 else "Comportamiento no disponible"
+        message = get_http_error_detail(error, message)
+        return {"status": "not_found" if error.code == 404 else "error", "message": message}
+    except Exception as error:
+        return {"status": "error", "message": str(error)}
+
+
 def analyze_iocs_with_virustotal(data: Dict[str, Any], api_key: Optional[str]) -> List[Dict[str, Any]]:
-    """Analiza todas las URLs e IPs encontradas utilizando VirusTotal."""
+    """Analiza URLs, IPs, dominio remitente y hashes de adjuntos en VirusTotal."""
     results = []
     targets_urls = data.get("links", [])
     targets_ips = data.get("detected_ips", [])
+    target_domain = data.get("from_domain", "")
+    attachment_hashes = [attachment.get("sha256") for attachment in data.get("attachments", []) if attachment.get("sha256")]
 
     if not api_key:
         # Registrar IoCs identificados para mostrarlos aunque no haya API key
@@ -415,9 +890,13 @@ def analyze_iocs_with_virustotal(data: Dict[str, Any], api_key: Optional[str]) -
             results.append({"target": u, "type": "URL", "status": "no_key", "message": "Omitido (sin API Key)"})
         for ip in targets_ips:
             results.append({"target": ip, "type": "IP", "status": "no_key", "message": "Omitido (sin API Key)"})
+        if target_domain:
+            results.append({"target": target_domain, "type": "DOMAIN", "status": "no_key", "message": "Omitido (sin API Key)"})
+        for file_hash in attachment_hashes:
+            results.append({"target": file_hash, "type": "FILE", "status": "no_key", "message": "Omitido (sin API Key; adjunto no subido)"})
         return results
 
-    total_iocs = len(targets_urls) + len(targets_ips)
+    total_iocs = len(targets_urls) + len(targets_ips) + bool(target_domain) + len(attachment_hashes)
     if total_iocs > 0:
         console.print(f"[bold cyan]🔍 Consultando VirusTotal API v3 para {len(targets_urls)} URL(s) y {len(targets_ips)} IP(s)...[/bold cyan]")
 
@@ -426,6 +905,12 @@ def analyze_iocs_with_virustotal(data: Dict[str, Any], api_key: Optional[str]) -
 
     for ip in targets_ips:
         results.append(vt_lookup_ip(ip, api_key))
+
+    if target_domain:
+        results.append(vt_lookup_domain(target_domain, api_key))
+
+    for file_hash in attachment_hashes:
+        results.append(vt_lookup_file_hash(file_hash, api_key))
 
     return results
 
@@ -441,10 +926,95 @@ def get_url_hostname(url: str) -> Optional[str]:
         return None
 
 
+def get_http_error_title(error: urllib.error.HTTPError, fallback: str) -> str:
+    """Extrae del JSON de error un título breve y legible para mostrar en la tabla."""
+    try:
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except (OSError, UnicodeError):
+        return fallback
+
+    if not body:
+        return fallback
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        payload = body
+
+    preferred_keys = ("title", "error", "message", "detail", "description", "reason")
+
+    def find_message(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in preferred_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for candidate in value.values():
+                message = find_message(candidate)
+                if message:
+                    return message
+        elif isinstance(value, list):
+            for candidate in value:
+                message = find_message(candidate)
+                if message:
+                    return message
+        elif isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0]
+        return None
+
+    message = find_message(payload)
+    return message[:240] if message else fallback
+
+
+def get_http_error_detail(error: urllib.error.HTTPError, fallback: str) -> str:
+    """Devuelve el código HTTP junto con la causa explicada por la API."""
+    try:
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except (OSError, UnicodeError):
+        body = ""
+
+    reason = ""
+    if body:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = body
+
+        preferred_keys = ("title", "error", "message", "detail", "description", "reason")
+        messages = []
+
+        def collect_messages(value: Any) -> None:
+            if isinstance(value, dict):
+                for key in preferred_keys:
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate.strip() and candidate.strip() not in messages:
+                        messages.append(candidate.strip())
+                for candidate in value.values():
+                    if isinstance(candidate, (dict, list)):
+                        collect_messages(candidate)
+            elif isinstance(value, list):
+                for candidate in value:
+                    collect_messages(candidate)
+            elif isinstance(value, str) and value.strip():
+                messages.append(value.strip().splitlines()[0])
+
+        collect_messages(payload)
+        reason = " — ".join(messages[:2])
+
+    if not reason and body and not body.startswith("{"):
+        reason = body.splitlines()[0].strip()
+    code = getattr(error, "code", "N/D")
+    if reason:
+        # Evita repetir el código si el proveedor ya lo incluyó en el cuerpo.
+        return f"HTTP {code}: {reason[:240]}"
+    return f"{fallback} (HTTP {code})"
+
+
 def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
-    """Envía una URL a urlscan.io con visibilidad unlisted."""
+    """Envía una URL a urlscan.io con visibilidad configurable (public por defecto)."""
     api_url = "https://urlscan.io/api/v1/scan/"
-    payload = json.dumps({"url": url, "visibility": "unlisted"}).encode()
+    visibility = os.environ.get("URLSCAN_VISIBILITY", "public").strip()
+    payload = json.dumps({"url": url, "visibility": visibility}).encode()
     req = urllib.request.Request(api_url, data=payload, headers={
         "API-Key": api_key,
         "Content-Type": "application/json",
@@ -463,7 +1033,7 @@ def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
                 "target": url,
                 "provider": "urlscan",
                 "status": "submitted",
-                "visibility": "unlisted",
+                "visibility": visibility,
                 "scan_id": scan_id,
                 "result_url": data.get("result") or (
                     f"https://urlscan.io/result/{scan_id}/" if scan_id else ""
@@ -476,8 +1046,13 @@ def urlscan_submit_url(url: str, api_key: str) -> Dict[str, Any]:
         elif e.code == 429:
             message = "Cuota de urlscan excedida (Rate Limit)."
         else:
-            message = f"Error HTTP {e.code} de urlscan."
-        return {"target": url, "provider": "urlscan", "status": "error", "message": message}
+            message = "Error al consultar urlscan."
+        return {
+            "target": url,
+            "provider": "urlscan",
+            "status": "error",
+            "message": get_http_error_detail(e, message),
+        }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
             "target": url,
@@ -533,8 +1108,8 @@ def urlscan_get_result(result: Dict[str, Any], api_key: str) -> Dict[str, Any]:
         elif e.code == 429:
             message = "Cuota de urlscan excedida al consultar el resultado (Rate Limit)."
         else:
-            message = f"Error HTTP {e.code} al consultar el resultado de urlscan."
-        result.update({"status": "error", "message": message})
+            message = "Error al consultar el resultado de urlscan."
+        result.update({"status": "error", "message": get_http_error_detail(e, message)})
         return result
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         result.update({
@@ -602,7 +1177,7 @@ def crtsh_lookup_domain(domain: str) -> Dict[str, Any]:
             "target": domain,
             "provider": "crt.sh",
             "status": "error",
-            "message": f"Error HTTP {e.code} de crt.sh."
+            "message": get_http_error_detail(e, "Error al consultar crt.sh")
         }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
@@ -661,8 +1236,13 @@ def whois_lookup_domain(domain: str, api_key: str) -> Dict[str, Any]:
         elif e.code == 404:
             message = "who.is no encontró datos para este dominio."
         else:
-            message = f"Error HTTP {e.code} de who.is."
-        return {"target": domain, "provider": "WHOIS", "status": "error", "message": message}
+            message = "Error al consultar who.is."
+        return {
+            "target": domain,
+            "provider": "WHOIS",
+            "status": "error",
+            "message": get_http_error_detail(e, message),
+        }
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeError) as e:
         return {
             "target": domain,
@@ -686,7 +1266,8 @@ def analyze_links_with_intel(
 
     results = []
     if urlscan_api_key:
-        console.print(f"[bold cyan]🔍 Enviando {len(urls)} URL(s) a urlscan (visibilidad unlisted)...[/bold cyan]")
+        visibility = os.environ.get("URLSCAN_VISIBILITY", "public").strip()
+        console.print(f"[bold cyan]🔍 Enviando {len(urls)} URL(s) a urlscan (visibilidad {visibility})...[/bold cyan]")
         for url in urls:
             results.append(urlscan_submit_url(url, urlscan_api_key))
         urlscan_wait_for_results(results, urlscan_api_key)
@@ -729,7 +1310,11 @@ def analyze_links_with_intel(
 # MOTOR HEURÍSTICO DE EVALUACIÓN
 # ============================================================================
 
-def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def evaluate_email_security(
+    data: Dict[str, Any],
+    vt_results: Optional[List[Dict[str, Any]]] = None,
+    deobfuscation_results: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """
     Motor heurístico avanzado de evaluación de amenazas de correo.
     Detecta Phishing, Spoofing, Homóglifos (Punycode), BEC y fallas de autenticación.
@@ -833,6 +1418,26 @@ def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict
                     score += 25
                     reasons.append(f"⚠️ [bold yellow]VirusTotal Sospecha ({vt['type']}):[/bold yellow] [cyan]{vt['target']}[/cyan] marcado como sospechoso por {susp} motores.")
 
+    # 10. Integración de Desofuscación Forense
+    if deobfuscation_results:
+        malicious_obf = [r for r in deobfuscation_results if r.get("verdict") == "MALICIOSO"]
+        suspicious_obf = [r for r in deobfuscation_results if r.get("verdict") == "SOSPECHOSO"]
+        if malicious_obf:
+            score += 35
+            threat_types.append("Evasión de Defensas / Contenido Ofuscado (MITRE T1027)")
+            for item in malicious_obf[:2]:
+                reasons.append(
+                    f"🔴 [bold]Ofuscación Maliciosa Detectada ({item.get('label', 'Payload')}):[/bold] "
+                    f"{item.get('forensic_interpretation')}"
+                )
+        elif suspicious_obf:
+            score += 15
+            for item in suspicious_obf[:2]:
+                reasons.append(
+                    f"🟡 [bold]Contenido Ofuscado Sospechoso ({item.get('label', 'Contenido')}):[/bold] "
+                    f"{item.get('forensic_interpretation')}"
+                )
+
     final_score = max(0, min(100, score))
 
     # Reglas críticas de seguridad (Override para ataques avanzados)
@@ -840,10 +1445,14 @@ def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict
         final_score = max(final_score, 85)
         reasons.insert(0, "⚠️ [bold yellow]Autenticación Engañosa:[/bold yellow] SPF/DKIM/DMARC están activos para el dominio del atacante, pero la identidad visible suplanta a directivos.")
 
+    if "Evasión de Defensas / Contenido Ofuscado (MITRE T1027)" in threat_types:
+        final_score = max(final_score, 75)
+        reasons.insert(0, "🚨 [bold red]Payload Malicioso Oculto:[/bold red] Se descubrió carga útil encubierta (MITRE T1027) diseñada para evadir controles perimetrales.")
+
     if is_punycode or has_cyrillic:
         final_score = max(final_score, 90)
 
-    if final_score >= 60 or (spf == "fail" and dmarc == "fail") or is_punycode or "Fraude del CEO / BEC (Business Email Compromise)" in threat_types or any("Detección Maliciosa" in t for t in threat_types):
+    if final_score >= 60 or (spf == "fail" and dmarc == "fail") or is_punycode or "Fraude del CEO / BEC (Business Email Compromise)" in threat_types or "Evasión de Defensas / Contenido Ofuscado (MITRE T1027)" in threat_types or any("Detección Maliciosa" in t for t in threat_types):
         verdict = "ALTO RIESGO - POSIBLE PHISHING / SUPLANTACIÓN"
         verdict_color = "bold white on red"
         badge_style = "red"
@@ -924,14 +1533,35 @@ def format_intel_badge(res: Dict[str, Any]) -> Text:
     return Text(" ⚠️ ERROR ", style="bold white on dark_red")
 
 
+def format_intel_details(res: Dict[str, Any], details: str) -> Text:
+    """Formatea detalles y convierte los informes remotos en enlaces clickeables."""
+    rendered = Text(details or "N/A")
+    report_url = res.get("result_url") or res.get("report_url")
+    if isinstance(report_url, str) and report_url.startswith(("http://", "https://")):
+        rendered.append("  [abrir informe]", style=f"link {report_url} underline bright_blue")
+    return rendered
+
+
+def format_deobf_verdict_badge(verdict: str) -> Text:
+    """Genera insignias para los veredictos forenses de desofuscación."""
+    v = (verdict or "").upper().strip()
+    if v == "MALICIOSO":
+        return Text(" ✖ MALICIOSO ", style="bold white on red")
+    elif v == "SOSPECHOSO":
+        return Text(" ! SOSPECHOSO ", style="bold black on yellow")
+    else:
+        return Text(" ✔ INOCUO ", style="bold white on green")
+
+
 def render_eml_analysis(
     data: Dict[str, Any],
     vt_results: Optional[List[Dict[str, Any]]] = None,
     has_vt_key: bool = False,
     url_intel_results: Optional[List[Dict[str, Any]]] = None,
+    cyberchef_results: Optional[List[Dict[str, Any]]] = None,
 ):
     """Muestra el reporte estilizado en terminal para un archivo EML."""
-    eval_res = evaluate_email_security(data, vt_results)
+    eval_res = evaluate_email_security(data, vt_results, deobfuscation_results=cyberchef_results)
 
     console.print()
     console.rule(f"[bold cyan]🔍 Análisis Forense de Correo: {data['file']}[/bold cyan]")
@@ -946,12 +1576,17 @@ def render_eml_analysis(
     if data["reply_to"]:
         mismatch_alert = " [bold red](⚠️ ¡No coincide con el remitente!)[/bold red]" if data["reply_to_domain"] != data["from_domain"] else ""
         meta_table.add_row("↩️ Responder a (Reply-To)", f"{data['reply_to']}{mismatch_alert}")
+    if data["return_path"]:
+        meta_table.add_row("↪️ Return-Path", data["return_path"])
     meta_table.add_row("🎯 Destinatario (To)", data["to_raw"] or "N/A")
     meta_table.add_row("✉️ Asunto (Subject)", data["subject"] or "(Sin asunto)")
     if data["date"]:
         meta_table.add_row("📅 Fecha", data["date"])
     if data["source_ip"]:
         meta_table.add_row("🌐 IP de Origen", data["source_ip"])
+    if data.get("attachments"):
+        attachment_names = ", ".join(attachment["name"] for attachment in data["attachments"])
+        meta_table.add_row("📎 Adjuntos", attachment_names)
 
     console.print(Panel(meta_table, title="[bold]📌 Metadatos y Cabeceras del Correo[/bold]", border_style="cyan"))
 
@@ -996,9 +1631,9 @@ def render_eml_analysis(
     if vt_results:
         vt_table = Table(box=box.ROUNDED, expand=True)
         vt_table.add_column("Tipo", style="bold cyan", width=8, justify="center")
-        vt_table.add_column("Indicador / Objetivo (IoC)", style="white", ratio=2)
-        vt_table.add_column("Estado VirusTotal", justify="center", width=20)
-        vt_table.add_column("Detalles / Reputación", style="dim white", ratio=2)
+        vt_table.add_column("Indicador / Objetivo (IoC)", style="white", ratio=2, overflow="fold")
+        vt_table.add_column("Estado VirusTotal", justify="center", width=20, overflow="fold")
+        vt_table.add_column("Detalles / Reputación", style="dim white", ratio=2, overflow="fold")
 
         for res in vt_results:
             target_str = res.get("target", "")
@@ -1009,6 +1644,10 @@ def render_eml_analysis(
             if status == "success":
                 if res.get("type") == "URL":
                     detalles = f"Rep: {res.get('reputation', 0)} | Categorías: {', '.join(res.get('categories', [])) or 'N/A'}"
+                elif res.get("type") == "DOMAIN":
+                    detalles = f"Rep: {res.get('reputation', 0)} | Malicioso: {res.get('malicious', 0)} | Categorías: {', '.join(res.get('categories', [])) or 'N/A'}"
+                elif res.get("type") == "FILE":
+                    detalles = f"Malicioso: {res.get('malicious', 0)} | Nombre: {res.get('meaningful_name') or 'N/D'} | Tipo: {res.get('type_description') or 'N/D'}"
                 else:
                     detalles = f"País: {res.get('country', 'N/A')} | Org: {res.get('as_owner', 'N/A')} | Red: {res.get('network', 'N/A')}"
             else:
@@ -1027,9 +1666,9 @@ def render_eml_analysis(
     if url_intel_results:
         intel_table = Table(box=box.ROUNDED, expand=True)
         intel_table.add_column("Servicio", style="bold cyan", width=12)
-        intel_table.add_column("URL / Dominio", style="white", ratio=2)
-        intel_table.add_column("Estado", justify="center", width=18)
-        intel_table.add_column("Detalles", style="dim white", ratio=3)
+        intel_table.add_column("URL / Dominio", style="white", ratio=2, overflow="fold")
+        intel_table.add_column("Estado", justify="center", width=18, overflow="fold")
+        intel_table.add_column("Resultado / Error", style="dim white", ratio=3, overflow="fold")
 
         for res in url_intel_results:
             target = res.get("target", "")
@@ -1059,7 +1698,7 @@ def render_eml_analysis(
                 res.get("provider", "URL"),
                 target,
                 format_intel_badge(res),
-                details,
+                format_intel_details(res, details),
             )
 
         console.print(Panel(
@@ -1067,6 +1706,7 @@ def render_eml_analysis(
             title="[bold]🔗 Análisis de URLs (urlscan, crt.sh y WHOIS)[/bold]",
             border_style="bright_blue"
         ))
+
     elif data.get("links"):
         console.print(Panel(
             "[dim]No se encontraron URLs HTTP(S) válidas para analizar.[/dim]",
@@ -1074,7 +1714,83 @@ def render_eml_analysis(
             border_style="dim blue"
         ))
 
-    # 5. Panel de Veredicto y Diagnóstico Anti-Phishing
+    # 5. Desofuscación y Análisis Forense de Carga Útil (Chepy / MITRE ATT&CK T1027)
+    if cyberchef_results:
+        meaningful = [r for r in cyberchef_results if not r.get("is_noise", False) and r.get("status") == "success"]
+        noise = [r for r in cyberchef_results if r.get("is_noise", False) and r.get("status") == "success"]
+        skipped = [r for r in cyberchef_results if r.get("status") in ("skipped", "unavailable", "unresolved", "error")]
+
+        if meaningful:
+            deobf_table = Table(box=box.ROUNDED, expand=True)
+            deobf_table.add_column("Técnica / Tipo", style="bold cyan", width=22)
+            deobf_table.add_column("Contenido Extraído", style="white", ratio=2, overflow="fold")
+            deobf_table.add_column("Interpretación Forense (Intención)", style="dim white", ratio=3, overflow="fold")
+            deobf_table.add_column("Impacto C-I-A", style="white", ratio=2, overflow="fold")
+            deobf_table.add_column("Veredicto", justify="center", width=14)
+
+            for item in meaningful:
+                content = item.get("extracted_content", "")
+                if len(content) > 120:
+                    content = content[:117] + "..."
+                interp = item.get("forensic_interpretation", "N/A")
+                impact = item.get("cia_impact", "N/A")
+                deobf_table.add_row(
+                    f"{item.get('label', 'Carga')}\n[dim]({item.get('method', 'Chepy')})[/dim]",
+                    content,
+                    interp,
+                    impact,
+                    format_deobf_verdict_badge(item.get("verdict", "INOCUO")),
+                )
+
+            console.print(Panel(
+                deobf_table,
+                title="[bold]🧪 Desofuscación y Clasificación de Amenazas (Chepy / MITRE T1027)[/bold]",
+                border_style="red" if any(i.get("verdict") == "MALICIOSO" for i in meaningful) else "yellow",
+            ))
+
+            # Ficha Forense estructurada lista para el informe del TP
+            for item in meaningful:
+                if item.get("verdict") in ("MALICIOSO", "SOSPECHOSO"):
+                    ficha_text = (
+                        f"• [bold cyan]Técnica de Evasión:[/bold cyan] {item.get('threat_type', 'Evasión de Defensas (MITRE T1027)')}\n"
+                        f"• [bold cyan]Mecanismo de Ofuscación:[/bold cyan] {item.get('method', 'Codificación')}\n"
+                        f"• [bold cyan]Intención del Atacante:[/bold cyan] {item.get('forensic_interpretation', 'N/A')}\n"
+                        f"• [bold cyan]Impacto C-I-A (Seguridad):[/bold cyan] {item.get('cia_impact', 'N/A')}\n"
+                        f"• [bold cyan]Recomendación de Mitigación:[/bold cyan] {item.get('recommendation', 'N/A')}"
+                    )
+                    console.print(Panel(
+                        ficha_text,
+                        title=f"[bold]📋 Ficha de Análisis Forense (Lista para el Informe del TP) — {item.get('label', 'Hallazgo')}[/bold]",
+                        border_style="bold red" if item.get("verdict") == "MALICIOSO" else "yellow",
+                    ))
+
+        if noise:
+            noise_summary = (
+                f"[dim]ℹ️ Se procesaron {len(noise)} fragmento(s) codificado(s) correspondientes a parámetros de URLs. "
+                "Fueron verificados y clasificados como [bold]tokens de telemetría / seguimiento de campañas inocuos[/bold] "
+                "(descartados: no contienen comandos de consola, ejecutables ni enlaces maliciosos ocultos).[/dim]"
+            )
+            console.print(Panel(
+                noise_summary,
+                title="[bold]🧪 Desofuscación de Telemetría (Tokens Inocuos)[/bold]",
+                border_style="dim green",
+            ))
+
+        if not meaningful and not noise:
+            msg = skipped[0].get("message", "Fragmento omitido.") if skipped else "No se pudo interpretar el contenido."
+            console.print(Panel(
+                f"[yellow]⚠️ {msg}[/yellow]",
+                title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
+                border_style="yellow",
+            ))
+    else:
+        console.print(Panel(
+            "[dim]No se detectaron fragmentos Base64, URL-encoded o hexadecimales para procesar.[/dim]",
+            title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
+            border_style="dim green",
+        ))
+
+    # 6. Panel de Veredicto y Diagnóstico Anti-Phishing
     score = eval_res["score"]
     body_lines = []
     body_lines.append(f"\n {eval_res['status_icon']}  [bold]VEREDICTO:[/bold] [{eval_res['verdict_color']}]{eval_res['verdict']}[/]  |  Puntaje de Riesgo: [bold]{score}/100[/bold]\n")
@@ -1178,6 +1894,175 @@ def prompt_for_eml_file() -> str:
         console.print(f"[bold red]❌ El archivo '{choice}' no fue encontrado.[/bold red] Inténtelo de nuevo.")
 
 
+def prompt_for_analysis_mode() -> str:
+    """Muestra el menú principal y devuelve el tipo de recurso elegido."""
+    menu = Table(box=box.ROUNDED, show_header=True, expand=True)
+    menu.add_column("#", style="bold cyan", width=5, justify="center")
+    menu.add_column("Recurso", style="bold white")
+    menu.add_column("Alcance", style="dim white")
+    menu.add_row("1", "Correos (.eml)", "Cabeceras, contenido, URLs e indicadores")
+    menu.add_row("2", "Enlaces / dominios", "Reputación y datos del dominio")
+    menu.add_row("3", "Archivos", "Metadatos y huellas SHA-256, SHA-1 y MD5")
+    console.print(Panel(menu, title="[bold]🛡️ Analizador Forense[/bold]", border_style="bright_blue"))
+
+    choices = {"1": "email", "2": "link", "3": "file"}
+    while True:
+        try:
+            selected = Prompt.ask(
+                "[bold cyan]➤ Elija qué desea analizar[/bold cyan] [dim](1-3, o 'q' para salir)[/dim]"
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operación cancelada.[/yellow]")
+            sys.exit(0)
+        if selected in {"q", "quit", "exit", "salir"}:
+            console.print("[bold yellow]Saliendo del programa. ¡Hasta luego![/bold yellow]")
+            sys.exit(0)
+        if selected in choices:
+            return choices[selected]
+        console.print("[red]⚠️ Seleccione 1, 2 o 3.[/red]")
+
+
+def prompt_for_link() -> str:
+    """Solicita una URL o dominio y lo normaliza a una URL HTTP(S)."""
+    while True:
+        try:
+            value = Prompt.ask("[bold cyan]➤ Ingrese la URL o dominio a analizar[/bold cyan]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operación cancelada.[/yellow]")
+            sys.exit(0)
+        if value.lower() in {"q", "quit", "exit", "salir"}:
+            sys.exit(0)
+        if value and get_url_hostname(value if "://" in value else f"https://{value}"):
+            return value if "://" in value else f"https://{value}"
+        console.print("[red]⚠️ Ingrese una URL HTTP(S) o un dominio válido.[/red]")
+
+
+def prompt_for_file() -> str:
+    """Solicita un archivo local sin abrirlo ni ejecutarlo."""
+    while True:
+        try:
+            value = Prompt.ask("[bold cyan]➤ Ingrese la ruta del archivo a analizar[/bold cyan]").strip().strip('"')
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Operación cancelada.[/yellow]")
+            sys.exit(0)
+        if value.lower() in {"q", "quit", "exit", "salir"}:
+            sys.exit(0)
+        if os.path.isfile(value):
+            return value
+        console.print("[red]⚠️ El archivo indicado no existe o no es un archivo regular.[/red]")
+
+
+def is_eicar_test_file(content: bytes) -> bool:
+    """Detecta la cadena estándar EICAR sin ejecutar el archivo."""
+    signature = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+    return signature in content
+
+
+def analyze_file_locally(filepath: str) -> Dict[str, Any]:
+    """Obtiene metadatos y hashes sin ejecutar ni subir el archivo."""
+    digesters = {"SHA-256": hashlib.sha256(), "SHA-1": hashlib.sha1(), "MD5": hashlib.md5()}
+    with open(filepath, "rb") as file_handle:
+        while chunk := file_handle.read(1024 * 1024):
+            for digester in digesters.values():
+                digester.update(chunk)
+    metadata = os.stat(filepath)
+    mime_type, _ = mimetypes.guess_type(filepath)
+    with open(filepath, "rb") as file_handle:
+        header = file_handle.read(8192)
+    signatures = {
+        b"MZ": "Ejecutable PE de Windows",
+        b"\x7fELF": "Ejecutable ELF",
+        b"PK\x03\x04": "Contenedor ZIP/Office moderno",
+        b"%PDF-": "Documento PDF",
+        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1": "Documento Office OLE",
+    }
+    detected_type = next((description for signature, description in signatures.items() if header.startswith(signature)), "No determinado")
+    extension = os.path.splitext(filepath)[1].lower()
+    script_extensions = {".bat", ".cmd", ".ps1", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".sh", ".py", ".pl"}
+    has_macros = False
+    if extension in {".docm", ".xlsm", ".pptm", ".doc", ".xls", ".ppt"} or header.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(filepath) as archive:
+                has_macros = any(name.lower().endswith("vbaproject.bin") for name in archive.namelist())
+        except (zipfile.BadZipFile, OSError):
+            pass
+    eicar_detected = is_eicar_test_file(header)
+    return {
+        "file": os.path.basename(filepath),
+        "size": metadata.st_size,
+        "modified": datetime.fromtimestamp(metadata.st_mtime).isoformat(sep=" ", timespec="seconds"),
+        "mime_type": mime_type or "No determinado",
+        "detected_type": detected_type,
+        "is_script": extension in script_extensions,
+        "has_macros": has_macros,
+        "eicar_detected": eicar_detected,
+        "hashes": {name: digester.hexdigest() for name, digester in digesters.items()},
+    }
+
+
+def render_file_analysis(data: Dict[str, Any]) -> None:
+    """Muestra el análisis estático local de un archivo."""
+    table = Table(box=box.ROUNDED, show_header=False, expand=True)
+    table.add_column("Campo", style="bold cyan", width=18)
+    table.add_column("Valor", style="white")
+    table.add_row("Archivo", data["file"])
+    table.add_row("Tamaño", f"{data['size']:,} bytes")
+    table.add_row("Tipo estimado", data["mime_type"])
+    table.add_row("Tipo por firma", data["detected_type"])
+    table.add_row("Modificado", data["modified"])
+    table.add_row("Script", "Sí" if data["is_script"] else "No")
+    table.add_row("Macros Office", "Sí" if data["has_macros"] else "No detectadas")
+    table.add_row("EICAR", "[bold red]Detectado (archivo de prueba)[/bold red]" if data["eicar_detected"] else "No detectado")
+    for name, digest in data["hashes"].items():
+        table.add_row(name, digest)
+    console.print(Panel(
+        table,
+        title="[bold]📁 Análisis estático de archivo[/bold]",
+        subtitle="[dim]No se ejecutó ni se subió el archivo.[/dim]",
+        border_style="yellow",
+    ))
+
+
+def render_file_reputation(result: Dict[str, Any], behavior: Optional[Dict[str, Any]] = None) -> None:
+    """Muestra la reputación de un hash y el estado del paso de sandbox."""
+    details = result.get("message") or (
+        f"Malicioso: {result.get('malicious', 0)} | Sospechoso: {result.get('suspicious', 0)} | "
+        f"Nombre: {result.get('meaningful_name') or 'N/D'}"
+    )
+    table = Table(box=box.ROUNDED, show_header=False, expand=True)
+    table.add_column("Paso", style="bold cyan", width=22)
+    table.add_column("Resultado", style="white")
+    table.add_row("VirusTotal por hash", details)
+    if behavior and behavior.get("status") == "success":
+        table.add_row(
+            "Sandbox existente",
+            f"{behavior.get('sandbox')} | Veredicto: {behavior.get('verdict')} | Procesos: {behavior.get('processes')} | Red: {behavior.get('network')}",
+        )
+    else:
+        table.add_row("Sandbox", (behavior or {}).get("message", "No configurado: el archivo no se ejecutó ni se subió automáticamente."))
+    console.print(Panel(table, title="[bold]🔎 Reputación y comportamiento[/bold]", border_style="magenta"))
+
+
+def render_link_analysis(url: str, vt_results: List[Dict[str, Any]], intel_results: List[Dict[str, Any]]) -> None:
+    """Muestra resultados de análisis de una URL/dominio sin simular un correo."""
+    console.rule(f"[bold cyan]🔗 Análisis de enlace: {url}[/bold cyan]")
+    for result in vt_results + intel_results:
+        provider = result.get("provider") or "VirusTotal"
+        target = result.get("target", url)
+        status = result.get("status", "N/D")
+        details = result.get("message") or result.get("result_url") or "Consulta completada."
+        if result.get("malicious") is not None:
+            details = f"Malicioso: {result['malicious']} | Puntaje: {result.get('score', 'N/D')}"
+        table = Table(box=box.ROUNDED, show_header=False, expand=True)
+        table.add_column("Campo", style="bold cyan", width=14)
+        table.add_column("Valor", style="white")
+        table.add_row("Servicio", provider)
+        table.add_row("Objetivo", target)
+        table.add_row("Estado", status)
+        table.add_row("Detalles", details)
+        console.print(Panel(table, title="[bold]Resultado de inteligencia[/bold]", border_style="blue"))
+
+
 def resolve_virustotal_key(cli_key: Optional[str], is_interactive: bool = False) -> Optional[str]:
     """Obtiene la clave de VirusTotal desde CLI, variables de entorno o consulta interactiva."""
     if cli_key:
@@ -1204,24 +2089,22 @@ def resolve_virustotal_key(cli_key: Optional[str], is_interactive: bool = False)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analizador Forense de Correo EML (SPF, DKIM, DMARC, Phishing y análisis de URLs).",
-        epilog="Ejemplo: python analizador.py caso_grupo_1_paqueteria.eml"
+        description="Analizador forense de correos, enlaces y archivos.",
+        epilog="Ejemplos: python analizador.py caso.eml | python analizador.py --url example.com | python analizador.py --file muestra.bin"
     )
     parser.add_argument("archivo_eml", nargs="?", default=None, help="Ruta al archivo EML (opcional)")
+    parser.add_argument("--url", "--link", dest="url", default=None, help="URL o dominio a analizar")
+    parser.add_argument("--file", dest="file_path", default=None, help="Archivo local para calcular hashes y metadatos")
     parser.add_argument("--vt-key", "--api-key", dest="vt_key", default=None, help="API Key de VirusTotal (o usar variable VIRUSTOTAL_API_KEY)")
+    parser.add_argument("--no-deobfuscation", "--no-cyberchef", dest="no_deobfuscation", action="store_true", help="No ejecutar la desofuscación local de fragmentos")
     args = parser.parse_args()
 
-    # show_welcome_screen()
+    selected_inputs = sum(bool(value) for value in (args.archivo_eml, args.url, args.file_path))
+    if selected_inputs > 1:
+        parser.error("Use solo uno: archivo EML posicional, --url o --file.")
 
-    is_interactive = (args.archivo_eml is None)
-    target_file = args.archivo_eml
-    if not target_file:
-        target_file = prompt_for_eml_file()
-    else:
-        if not os.path.isfile(target_file):
-            console.print(f"[bold yellow]⚠️ El archivo especificado '{target_file}' no existe.[/bold yellow]")
-            target_file = prompt_for_eml_file()
-            is_interactive = True
+    resource_type = "email" if args.archivo_eml else "link" if args.url else "file" if args.file_path else prompt_for_analysis_mode()
+    is_interactive = selected_inputs == 0
 
     # Las claves se cargan desde .env o desde el entorno del proceso.
     vt_key = resolve_virustotal_key(args.vt_key, is_interactive=is_interactive)
@@ -1229,23 +2112,50 @@ def main():
     urlscan_key = os.environ.get("URLSCAN_API_KEY", "").strip() or None
     whois_key = os.environ.get("WHOIS_API_KEY", "").strip() or None
 
-    console.print(f"\n[bold green]⚙️  Procesando correo:[/bold green] [cyan]{target_file}[/cyan]...")
     try:
-        data = parse_eml_file(target_file)
-        
-        # Consultar IoCs en VirusTotal
-        vt_results = analyze_iocs_with_virustotal(data, vt_key)
-        url_intel_results = analyze_links_with_intel(data, urlscan_key, whois_key)
-
-        render_eml_analysis(
-            data,
-            vt_results,
-            has_vt_key=has_vt_key,
-            url_intel_results=url_intel_results,
-        )
-        
-        if not has_vt_key and (data.get("links") or data.get("detected_ips")):
-            console.print("[dim yellow]💡 Tip: Configura tu API Key mediante export VIRUSTOTAL_API_KEY='tu_clave' o con --vt-key para ver detecciones de antivirus en tiempo real.[/dim yellow]")
+        if resource_type == "email":
+            target_file = args.archivo_eml or prompt_for_eml_file()
+            if not os.path.isfile(target_file):
+                console.print(f"[bold yellow]⚠️ El archivo especificado '{target_file}' no existe.[/bold yellow]")
+                target_file = prompt_for_eml_file()
+            console.print(f"\n[bold green]⚙️ Procesando correo:[/bold green] [cyan]{target_file}[/cyan]...")
+            data = parse_eml_file(target_file)
+            vt_results = analyze_iocs_with_virustotal(data, vt_key)
+            url_intel_results = analyze_links_with_intel(data, urlscan_key, whois_key)
+            cyberchef_results = [] if args.no_deobfuscation else analyze_obfuscation(
+                f"{data.get('subject', '')}\n{data.get('body', '')}"
+            )
+            render_eml_analysis(
+                data,
+                vt_results,
+                has_vt_key=has_vt_key,
+                url_intel_results=url_intel_results,
+                cyberchef_results=cyberchef_results,
+            )
+            if not has_vt_key and (data.get("links") or data.get("detected_ips")):
+                console.print("[dim yellow]💡 Tip: Configura VIRUSTOTAL_API_KEY o usa --vt-key para ver detecciones de antivirus en tiempo real.[/dim yellow]")
+        elif resource_type == "link":
+            target_url = args.url or prompt_for_link()
+            target_url = target_url if "://" in target_url else f"https://{target_url}"
+            if not get_url_hostname(target_url):
+                raise ValueError("La URL o dominio indicado no es válido.")
+            link_data = {"links": [target_url], "detected_ips": []}
+            render_link_analysis(
+                target_url,
+                analyze_iocs_with_virustotal(link_data, vt_key),
+                analyze_links_with_intel(link_data, urlscan_key, whois_key),
+            )
+        else:
+            target_file = args.file_path or prompt_for_file()
+            if not os.path.isfile(target_file):
+                raise FileNotFoundError(f"No se encontró el archivo: {target_file}")
+            file_data = analyze_file_locally(target_file)
+            render_file_analysis(file_data)
+            if vt_key:
+                file_hash = file_data["hashes"]["SHA-256"]
+                render_file_reputation(vt_lookup_file_hash(file_hash, vt_key), vt_lookup_file_behavior(file_hash, vt_key))
+            else:
+                render_file_reputation({"status": "no_key", "message": "Omitido (sin VIRUSTOTAL_API_KEY); solo se calculó el hash local."})
 
         console.print(f"\n[dim green]✔ Análisis completado exitosamente.[/dim green]\n")
     except Exception as e:
