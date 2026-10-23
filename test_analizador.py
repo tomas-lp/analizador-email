@@ -1,7 +1,10 @@
 import json
+import os
+import tempfile
+import hashlib
 import unittest
 import urllib.parse
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import analizador
 
@@ -21,6 +24,86 @@ class FakeResponse:
 
 
 class UrlIntelTests(unittest.TestCase):
+    def test_analyzes_file_without_executing_it(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as file_handle:
+            file_handle.write(b"contenido de prueba")
+            filepath = file_handle.name
+        try:
+            data = analizador.analyze_file_locally(filepath)
+        finally:
+            os.unlink(filepath)
+
+        self.assertEqual(data["size"], len(b"contenido de prueba"))
+        self.assertEqual(data["hashes"]["SHA-256"], hashlib.sha256(b"contenido de prueba").hexdigest())
+
+    def test_uses_oldest_received_header_for_source_ip(self):
+        message = (
+            b"From: sender@example.com\n"
+            b"To: user@example.net\n"
+            b"Received: from relay.example ([198.51.100.10])\n"
+            b"Received: from origin.example ([203.0.113.25])\n"
+            b"Content-Type: text/plain; charset=utf-8\n\nHola"
+        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".eml") as file_handle:
+            file_handle.write(message)
+            filepath = file_handle.name
+        try:
+            data = analizador.parse_eml_file(filepath)
+        finally:
+            os.unlink(filepath)
+
+        self.assertEqual(data["source_ip"], "203.0.113.25")
+
+    def test_detects_eicar_without_executing_it(self):
+        eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+        self.assertTrue(analizador.is_eicar_test_file(eicar))
+
+    def test_looks_up_file_hash_without_uploading_file(self):
+        response = {"data": {"attributes": {"last_analysis_stats": {"malicious": 2, "suspicious": 1}}}}
+        with patch.object(analizador.urllib.request, "urlopen", return_value=FakeResponse(response)) as mocked_urlopen:
+            result = analizador.vt_lookup_file_hash("a" * 64, "test-key")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["malicious"], 2)
+        self.assertIn("/files/" + "a" * 64, mocked_urlopen.call_args.args[0].full_url)
+
+    def test_reads_existing_sandbox_behavior_by_hash(self):
+        response = {"data": [{"attributes": {"sandbox_name": "Sandbox", "verdict": "malicious", "processes": [{}], "network_connections": [{}, {}]}}]}
+        with patch.object(analizador.urllib.request, "urlopen", return_value=FakeResponse(response)):
+            result = analizador.vt_lookup_file_behavior("b" * 64, "test-key")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["processes"], 1)
+        self.assertEqual(result["network"], 2)
+    def test_extracts_common_obfuscation_candidates(self):
+        text = "Texto U29tZSBtYWxpY2lvdXMgcGF5bG9hZA== %68%6f%6c%61 48 65 6c 6c 6f 20 77 6f 72 6c 64"
+        candidates = analizador.extract_obfuscated_candidates(text)
+
+        self.assertIn("U29tZSBtYWxpY2lvdXMgcGF5bG9hZA==", candidates)
+        self.assertIn("%68%6f%6c%61", candidates)
+        self.assertIn("48 65 6c 6c 6f 20 77 6f 72 6c 64", candidates)
+
+    @patch.object(analizador.subprocess, "run")
+    def test_runs_cyberchef_magic_locally(self, mocked_run):
+        mocked_run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps({"output": "texto decodificado", "type": "string"}),
+            stderr="",
+        )
+
+        results = analizador.analyze_obfuscation_with_cyberchef("U29tZSBtYWxpY2lvdXMgcGF5bG9hZA==")
+
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(results[0]["output"], "texto decodificado")
+        command = mocked_run.call_args.args[0]
+        self.assertEqual(command[0], "node")
+        self.assertTrue(command[1].endswith("cyberchef_bridge.mjs"))
+
+    @patch.object(analizador.subprocess, "run", side_effect=FileNotFoundError)
+    def test_reports_missing_node(self, _mocked_run):
+        results = analizador.analyze_obfuscation_with_cyberchef("U29tZSBtYWxpY2lvdXMgcGF5bG9hZA==")
+
+        self.assertEqual(results[0]["status"], "unavailable")
     def test_analyzes_http_links_with_all_services(self):
         responses = [
             {"uuid": "scan-123", "result": "https://urlscan.io/result/scan-123/"},

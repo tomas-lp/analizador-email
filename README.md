@@ -18,6 +18,24 @@ Herramienta de terminal desarrollada en Python con interfaz estilizada mediante 
 pip install -r requirements.txt
 ```
 
+### Desofuscación automática con CyberChef
+
+El analizador usa la API local de [CyberChef](https://github.com/gchq/CyberChef) para buscar fragmentos Base64, URL-encoded y hexadecimales en el asunto y cuerpo del correo, y los procesa con la receta `Magic`. No requiere API key ni transmite datos a Internet.
+
+Requiere Node.js 24 e instalar las dependencias JavaScript una vez:
+
+```bash
+npm install
+```
+
+La desofuscación se ejecuta por defecto al analizar un EML. Para omitirla:
+
+```bash
+python analizador.py caso_grupo_1_paqueteria.eml --no-cyberchef
+```
+
+Si Node 24 no está en el `PATH`, indica la ruta al ejecutable mediante `--cyberchef-node` o la variable `CYBERCHEF_NODE`.
+
 ---
 
 ## 🔐 Configuración de APIs
@@ -37,15 +55,19 @@ Las URLs se envían a urlscan.io con visibilidad **unlisted**; no aparecen en la
 
 ## 💻 Uso
 
-### 1. Modo Interactivo
-Ejecuta el programa directamente. Mostrará la pantalla de bienvenida, detectará automáticamente todos los archivos `.eml` en la carpeta y te permitirá elegir uno por número:
+### 1. Menú interactivo
+Ejecuta el programa sin argumentos para elegir el tipo de recurso:
+
+- **Correos (.eml):** cabeceras SPF/DKIM/DMARC, identidades, reputación de IP/dominio, enlaces, adjuntos y desofuscación.
+- **Enlaces / dominios:** reputación, URLScan, certificados y WHOIS disponibles.
+- **Archivos:** metadatos, tipo por firma, scripts/macros, control EICAR, hashes y reputación por SHA-256.
 
 ```bash
 python3 analizador.py
 ```
 
-### 2. Modo Directo por Argumento
-Analiza un archivo específico pasándolo como parámetro:
+### 2. Modo directo por argumento
+Puedes elegir un recurso sin pasar por el menú:
 
 ```bash
 # Análisis forense, de URLs y de IoCs (según las claves configuradas):
@@ -53,7 +75,15 @@ python3 analizador.py caso_grupo_1_paqueteria.eml
 
 # Sobrescribir la clave de VirusTotal:
 python3 analizador.py caso_grupo_1_paqueteria.eml --vt-key TU_API_KEY
+
+# Analizar un enlace o dominio:
+python3 analizador.py --url example.com
+
+# Calcular hashes y metadatos de un archivo local:
+python3 analizador.py --file muestra.bin
 ```
+
+Las consultas de VirusTotal usan únicamente el hash SHA-256 ya calculado: el programa **no sube el archivo**. Si el hash ya tiene comportamiento de sandbox en VirusTotal, lo informa; si no hay clave o historial, deja el paso indicado como omitido/sin reporte. El archivo nunca se ejecuta localmente ni se envía a una sandbox externa de forma automática.
 
 ---
 
