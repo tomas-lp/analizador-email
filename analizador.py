@@ -86,89 +86,276 @@ def extract_obfuscated_candidates(text: str) -> List[str]:
     return candidates
 
 
-def _decode_candidate_with_chepy(candidate: str) -> Optional[Tuple[str, str]]:
-    """Intenta decodificar un fragmento usando la librería Chepy.
-    
-    Devuelve (texto_decodificado, metodo_usado) o None si no aplica.
-    """
+def is_meaningful_text(text: str) -> bool:
+    """Verifica si un texto decodificado tiene suficiente estructura y legibilidad para ser considerado texto real."""
+    if not text or len(text.strip()) < 4:
+        return False
+    printable_count = sum(1 for c in text if c.isprintable() or c in "\r\n\t ")
+    ratio = printable_count / len(text)
+    if ratio < 0.80:
+        return False
+    if text.count("\ufffd") > max(2, len(text) * 0.05) or "\x00" in text:
+        return False
+    return True
+
+
+SCRIPT_EXECUTION_PATTERNS = [
+    r"\bpowershell(?:\.exe)?\b",
+    r"\bcmd(?:\.exe)?\b",
+    r"\b(?:iex|invoke-expression)\b",
+    r"\b(?:downloadstring|downloadfile)\b",
+    r"\b(?:certutil|bitsadmin|mshta|cscript|wscript)\b",
+    r"\b(?:bash|sh)\s+-i\b",
+    r"\b(?:curl|wget)\s+.*\|\s*(?:sh|bash)\b",
+    r"\b(?:eval|unescape)\s*\(",
+    r"\bExecutionPolicy\s+Bypass\b",
+]
+
+SOCIAL_ENGINEERING_KEYWORDS = [
+    r"\b(?:urgente|bloqueo|suspension|inmediato|verificar|confirmar|cuenta|banco|tarjeta|factura|pago|transferencia|clave|credenciales)\b",
+    r"\b(?:urgent|suspend|immediate|verify|confirm|account|bank|invoice|payment|wire|transfer|password|credential|gift|reward|prize)\b",
+]
+
+
+def classify_and_verify_payload(
+    raw_bytes: bytes,
+    decoded_text: str,
+    candidate: str,
+    method: str,
+) -> Dict[str, Any]:
+    """Clasifica, valida y genera la interpretación forense de un artefacto desofuscado."""
+    # 1. Validación de Payloads Binarios (Magic Bytes)
+    if raw_bytes.startswith(b"MZ"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Ejecutable Windows (PE / EXE / DLL)",
+            "extracted_content": f"Binario ejecutable Portable Executable (MZ) — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Se detectó un archivo ejecutable de Windows oculto en formato Base64. Indica intento directo de entrega de malware (Dropper).",
+            "threat_type": "Dropper / Malware Binario Embebido (MITRE T1027)",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Aislar la muestra, no ejecutar, extraer el binario únicamente en sandbox cerrada y bloquear el hash en EDR.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"PK\x03\x04"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Archivo Comprimido (ZIP / Office)",
+            "extracted_content": f"Contenedor comprimido ZIP / Documento Office — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Se detectó un contenedor ZIP o documento Office comprimido en Base64. Usado frecuentemente para evadir inspección de adjuntos.",
+            "threat_type": "Contenedor Comprimido / Documento Trampa (MITRE T1027)",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Inspeccionar el contenido del archivo en entorno aislado para buscar macros o scripts.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"%PDF"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Documento PDF Embebido",
+            "extracted_content": f"Documento PDF embebido — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Documento PDF codificado en el cuerpo. Puede contener enlaces de phishing o exploits dirigidos.",
+            "threat_type": "Documento Trampa (PDF)",
+            "cia_impact": "Pérdida de Confidencialidad",
+            "verdict": "SOSPECHOSO",
+            "confidence": "Alta",
+            "recommendation": "Analizar enlaces internos y streams del PDF con herramientas de análisis de documentos.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    if raw_bytes.startswith(b"\x7fELF"):
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "BINARY_PAYLOAD",
+            "label": "Binario Ejecutable Linux (ELF)",
+            "extracted_content": f"Binario ejecutable Linux ELF — {len(raw_bytes)} bytes",
+            "forensic_interpretation": "Binario ejecutable para entornos Linux/Unix codificado en Base64.",
+            "threat_type": "Malware para Linux / Dropper",
+            "cia_impact": "Pérdida de Integridad y Confidencialidad",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Bloquear hash en firewall perimetral y analizar en sandbox aislada.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    # 2. Validación de Scripts y Comandos Maliciosos
+    for pat in SCRIPT_EXECUTION_PATTERNS:
+        if re.search(pat, decoded_text, re.IGNORECASE):
+            return {
+                "input": candidate,
+                "method": method,
+                "status": "success",
+                "category": "MALICIOUS_SCRIPT",
+                "label": "Script / Comando de Consola",
+                "extracted_content": decoded_text.strip(),
+                "forensic_interpretation": "El atacante ofuscó un comando del sistema para ejecutar código sin alertar a los motores antivirus perimetrales.",
+                "threat_type": "Comando de Consola / Living-off-the-Land (MITRE T1059)",
+                "cia_impact": "Pérdida de Integridad y Disponibilidad (Control del sistema)",
+                "verdict": "MALICIOSO",
+                "confidence": "Alta",
+                "recommendation": "Bloquear ejecución de scripts en endpoints (PowerShell CLM / AppLocker) y revisar registros Sysmon.",
+                "is_malicious": True,
+                "is_noise": False,
+            }
+
+    # 3. Validación de URLs Ocultas / Phishing
+    hidden_urls = extract_links_from_text(decoded_text)
+    if hidden_urls:
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "HIDDEN_URL",
+            "label": "Enlace Oculto (URL Phishing)",
+            "extracted_content": ", ".join(hidden_urls),
+            "forensic_interpretation": "El correo ocultó una URL en Base64/Hex para impedir que la pasarela de seguridad o el filtro antispam inspeccione el destino de la redirección.",
+            "threat_type": "Evasión de Filtro Antispam / Phishing Encubierto (MITRE T1027)",
+            "cia_impact": "Pérdida de Confidencialidad (Robo de credenciales / Suplantación)",
+            "verdict": "MALICIOSO",
+            "confidence": "Alta",
+            "recommendation": "Bloquear la URL y su dominio en el proxy/firewall y concientizar a los usuarios.",
+            "is_malicious": True,
+            "is_noise": False,
+        }
+
+    # 4. Validación de Texto Legible / Ingeniería Social
+    if is_meaningful_text(decoded_text):
+        for pat in SOCIAL_ENGINEERING_KEYWORDS:
+            if re.search(pat, decoded_text, re.IGNORECASE):
+                return {
+                    "input": candidate,
+                    "method": method,
+                    "status": "success",
+                    "category": "SOCIAL_ENG_TEXT",
+                    "label": "Ingeniería Social Encubierta",
+                    "extracted_content": decoded_text.strip(),
+                    "forensic_interpretation": "Texto del señuelo ofuscado con palabras clave para sortear los filtros antispam semánticos.",
+                    "threat_type": "Evasión de Filtro de Contenido por Palabras Clave",
+                    "cia_impact": "Pérdida de Confidencialidad (Engaño al usuario)",
+                    "verdict": "SOSPECHOSO",
+                    "confidence": "Media",
+                    "recommendation": "Concientizar a los usuarios sobre correos con contenido codificado o no estándar.",
+                    "is_malicious": False,
+                    "is_noise": False,
+                }
+
+        return {
+            "input": candidate,
+            "method": method,
+            "status": "success",
+            "category": "READABLE_TEXT",
+            "label": "Texto Plano Codificado",
+            "extracted_content": decoded_text.strip(),
+            "forensic_interpretation": "Texto legible decodificado sin comandos ejecutables ni enlaces evidentes.",
+            "threat_type": "Contenido Codificado General",
+            "cia_impact": "N/A",
+            "verdict": "INOCUO",
+            "confidence": "Media",
+            "recommendation": "Revisar contexto del remitente.",
+            "is_malicious": False,
+            "is_noise": False,
+        }
+
+    # 5. Si no es legible ni contiene magic bytes: Token de Telemetría / Inocuo
+    return {
+        "input": candidate,
+        "method": method,
+        "status": "success",
+        "category": "TRACKING_TOKEN",
+        "label": "Token de Telemetría / Rastreo",
+        "extracted_content": f"[Hash/ID de telemetría de {len(raw_bytes)} bytes]",
+        "forensic_interpretation": "Parámetro aleatorio o hash de seguimiento de clics de la plataforma; no contiene código malicioso ni enlaces ocultos.",
+        "threat_type": "Identificador de Campaña / Telemetría (Inocuo)",
+        "cia_impact": "Ninguno",
+        "verdict": "INOCUO",
+        "confidence": "Alta",
+        "recommendation": "No requiere acción técnica adicional.",
+        "is_malicious": False,
+        "is_noise": True,
+    }
+
+
+def _decode_candidate_raw(candidate: str) -> Optional[Tuple[bytes, str, str]]:
+    """Intenta decodificar un fragmento devolviendo (raw_bytes, decoded_text, method)."""
+    # Intentar con Chepy si está disponible
     try:
         from chepy import Chepy
+        if "%" in candidate:
+            try:
+                res = Chepy(candidate).url_decode().o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                if text and text != candidate:
+                    return raw, text, "Chepy (URL Decode)"
+            except Exception:
+                pass
+
+        clean_hex = re.sub(r"[\s:]", "", candidate)
+        if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
+            try:
+                res = Chepy(clean_hex).from_hex().o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                return raw, text, "Chepy (Hex)"
+            except Exception:
+                pass
+
+        try:
+            res = Chepy(candidate).from_base64().o
+            raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+            text = raw.decode("utf-8", errors="replace")
+            return raw, text, "Chepy (Base64)"
+        except Exception:
+            pass
+
+        if "-" in candidate or "_" in candidate:
+            try:
+                res = Chepy(candidate).from_base64(alphabet="url_safe").o
+                raw = res.encode("utf-8", errors="replace") if isinstance(res, str) else res
+                text = raw.decode("utf-8", errors="replace")
+                return raw, text, "Chepy (Base64 URL-safe)"
+            except Exception:
+                pass
     except ImportError:
-        return None
-
-    # 1. Probar URL decode si contiene secuencias percent-encoded
-    if "%" in candidate:
-        try:
-            res = Chepy(candidate).url_decode().o
-            if isinstance(res, bytes):
-                res = res.decode("utf-8", errors="replace")
-            if res and res != candidate:
-                return str(res), "Chepy (URL Decode)"
-        except Exception:
-            pass
-
-    # 2. Probar Hexadecimal si coincide con formato hex
-    clean_hex = re.sub(r"[\s:]", "", candidate)
-    if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
-        try:
-            res = Chepy(clean_hex).from_hex().o
-            if isinstance(res, bytes):
-                res = res.decode("utf-8", errors="replace")
-            if res and any(c.isprintable() for c in res):
-                return str(res), "Chepy (Hex)"
-        except Exception:
-            pass
-
-    # 3. Probar Base64 estándar
-    try:
-        res = Chepy(candidate).from_base64().o
-        if isinstance(res, bytes):
-            res = res.decode("utf-8", errors="replace")
-        if res and any(c.isprintable() for c in res):
-            return str(res), "Chepy (Base64)"
-    except Exception:
         pass
 
-    # 4. Probar Base64 URL-safe si contiene caracteres de urlsafe
-    if "-" in candidate or "_" in candidate:
-        try:
-            res = Chepy(candidate).from_base64(alphabet="url_safe").o
-            if isinstance(res, bytes):
-                res = res.decode("utf-8", errors="replace")
-            if res and any(c.isprintable() for c in res):
-                return str(res), "Chepy (Base64 URL-safe)"
-        except Exception:
-            pass
-
-    return None
-
-
-def _decode_candidate_native(candidate: str) -> Optional[Tuple[str, str]]:
-    """Fallback nativo en Python estándar sin dependencias externas.
-    
-    Devuelve (texto_decodificado, metodo_usado) o None si no se puede decodificar.
-    """
-    # 1. Probar URL decode
+    # Fallback nativo de Python
     if "%" in candidate:
         try:
             decoded = urllib.parse.unquote(candidate)
             if decoded and decoded != candidate:
-                return decoded, "Python nativo (URL Decode)"
+                return decoded.encode("utf-8", errors="replace"), decoded, "Python nativo (URL Decode)"
         except Exception:
             pass
 
-    # 2. Probar Hexadecimal
     clean_hex = re.sub(r"[\s:]", "", candidate)
     if re.fullmatch(r"[0-9A-Fa-f]{16,}", clean_hex) and len(clean_hex) % 2 == 0:
         try:
             raw = binascii.unhexlify(clean_hex)
             decoded = raw.decode("utf-8", errors="replace")
-            if decoded and any(c.isprintable() for c in decoded):
-                return decoded, "Python nativo (Hex)"
+            return raw, decoded, "Python nativo (Hex)"
         except Exception:
             pass
 
-    # 3. Probar Base64 y Base64 URL-safe
     s = candidate.strip()
     s_std = s.replace("-", "+").replace("_", "/")
     padding = len(s_std) % 4
@@ -178,18 +365,29 @@ def _decode_candidate_native(candidate: str) -> Optional[Tuple[str, str]]:
     try:
         raw = base64.b64decode(s_std, validate=False)
         decoded = raw.decode("utf-8", errors="replace")
-        if decoded and any(c.isprintable() for c in decoded):
-            return decoded, "Python nativo (Base64)"
+        return raw, decoded, "Python nativo (Base64)"
     except Exception:
         pass
 
     return None
 
 
+def _decode_candidate_with_chepy(candidate: str) -> Optional[Tuple[str, str]]:
+    """Alias retrocompatible."""
+    res = _decode_candidate_raw(candidate)
+    return (res[1], res[2]) if res else None
+
+
+def _decode_candidate_native(candidate: str) -> Optional[Tuple[str, str]]:
+    """Alias retrocompatible."""
+    res = _decode_candidate_raw(candidate)
+    return (res[1], res[2]) if res else None
+
+
 def analyze_obfuscation(text: str, depth: int = 3) -> List[Dict[str, Any]]:
-    """Analiza y desofusca fragmentos sospechosos con Chepy o fallback nativo.
+    """Analiza, clasifica y valida fragmentos sospechosos con Chepy o fallback nativo.
     
-    Ejecución 100% en Python, sin llamadas externas a Node.js ni subprocesos.
+    Genera fichas forenses completas con taxonomía de amenazas, intención e impacto C-I-A.
     """
     candidates = extract_obfuscated_candidates(text)
     if not candidates:
@@ -201,41 +399,35 @@ def analyze_obfuscation(text: str, depth: int = 3) -> List[Dict[str, Any]]:
             results.append({
                 "input": candidate[:120] + "...",
                 "status": "skipped",
+                "category": "TRACKING_TOKEN",
+                "label": "Fragmento Omitido",
+                "verdict": "INOCUO",
+                "forensic_interpretation": f"Fragmento omitido: supera {DEOBFUSCATION_MAX_INPUT_CHARS} caracteres.",
                 "message": f"Fragmento omitido: supera {DEOBFUSCATION_MAX_INPUT_CHARS} caracteres.",
+                "is_noise": True,
+                "is_malicious": False,
             })
             continue
 
-        # Intentar primero con Chepy
-        chepy_res = _decode_candidate_with_chepy(candidate)
-        if chepy_res:
-            decoded, method = chepy_res
+        decoded = _decode_candidate_raw(candidate)
+        if decoded:
+            raw_bytes, decoded_str, method = decoded
+            finding = classify_and_verify_payload(raw_bytes, decoded_str, candidate, method)
+            finding["output"] = finding["extracted_content"]
+            finding["engine"] = method
+            results.append(finding)
+        else:
             results.append({
-                "input": candidate,
-                "status": "success",
-                "output": decoded,
-                "engine": method,
-                "type": "string",
+                "input": candidate[:120] + ("..." if len(candidate) > 120 else ""),
+                "status": "unresolved",
+                "category": "TRACKING_TOKEN",
+                "label": "Cadena Opaca",
+                "verdict": "INOCUO",
+                "forensic_interpretation": "Cadena opaca; no contiene formato decodificable conocido.",
+                "message": "No se pudo inferir una desofuscación válida para este fragmento.",
+                "is_noise": True,
+                "is_malicious": False,
             })
-            continue
-
-        # Fallback nativo de Python
-        native_res = _decode_candidate_native(candidate)
-        if native_res:
-            decoded, method = native_res
-            results.append({
-                "input": candidate,
-                "status": "success",
-                "output": decoded,
-                "engine": method,
-                "type": "string",
-            })
-            continue
-
-        results.append({
-            "input": candidate[:120] + ("..." if len(candidate) > 120 else ""),
-            "status": "unresolved",
-            "message": "No se pudo inferir una desofuscación válida para este fragmento.",
-        })
 
     return results
 
@@ -1118,7 +1310,11 @@ def analyze_links_with_intel(
 # MOTOR HEURÍSTICO DE EVALUACIÓN
 # ============================================================================
 
-def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def evaluate_email_security(
+    data: Dict[str, Any],
+    vt_results: Optional[List[Dict[str, Any]]] = None,
+    deobfuscation_results: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """
     Motor heurístico avanzado de evaluación de amenazas de correo.
     Detecta Phishing, Spoofing, Homóglifos (Punycode), BEC y fallas de autenticación.
@@ -1222,6 +1418,26 @@ def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict
                     score += 25
                     reasons.append(f"⚠️ [bold yellow]VirusTotal Sospecha ({vt['type']}):[/bold yellow] [cyan]{vt['target']}[/cyan] marcado como sospechoso por {susp} motores.")
 
+    # 10. Integración de Desofuscación Forense
+    if deobfuscation_results:
+        malicious_obf = [r for r in deobfuscation_results if r.get("verdict") == "MALICIOSO"]
+        suspicious_obf = [r for r in deobfuscation_results if r.get("verdict") == "SOSPECHOSO"]
+        if malicious_obf:
+            score += 35
+            threat_types.append("Evasión de Defensas / Contenido Ofuscado (MITRE T1027)")
+            for item in malicious_obf[:2]:
+                reasons.append(
+                    f"🔴 [bold]Ofuscación Maliciosa Detectada ({item.get('label', 'Payload')}):[/bold] "
+                    f"{item.get('forensic_interpretation')}"
+                )
+        elif suspicious_obf:
+            score += 15
+            for item in suspicious_obf[:2]:
+                reasons.append(
+                    f"🟡 [bold]Contenido Ofuscado Sospechoso ({item.get('label', 'Contenido')}):[/bold] "
+                    f"{item.get('forensic_interpretation')}"
+                )
+
     final_score = max(0, min(100, score))
 
     # Reglas críticas de seguridad (Override para ataques avanzados)
@@ -1229,10 +1445,14 @@ def evaluate_email_security(data: Dict[str, Any], vt_results: Optional[List[Dict
         final_score = max(final_score, 85)
         reasons.insert(0, "⚠️ [bold yellow]Autenticación Engañosa:[/bold yellow] SPF/DKIM/DMARC están activos para el dominio del atacante, pero la identidad visible suplanta a directivos.")
 
+    if "Evasión de Defensas / Contenido Ofuscado (MITRE T1027)" in threat_types:
+        final_score = max(final_score, 75)
+        reasons.insert(0, "🚨 [bold red]Payload Malicioso Oculto:[/bold red] Se descubrió carga útil encubierta (MITRE T1027) diseñada para evadir controles perimetrales.")
+
     if is_punycode or has_cyrillic:
         final_score = max(final_score, 90)
 
-    if final_score >= 60 or (spf == "fail" and dmarc == "fail") or is_punycode or "Fraude del CEO / BEC (Business Email Compromise)" in threat_types or any("Detección Maliciosa" in t for t in threat_types):
+    if final_score >= 60 or (spf == "fail" and dmarc == "fail") or is_punycode or "Fraude del CEO / BEC (Business Email Compromise)" in threat_types or "Evasión de Defensas / Contenido Ofuscado (MITRE T1027)" in threat_types or any("Detección Maliciosa" in t for t in threat_types):
         verdict = "ALTO RIESGO - POSIBLE PHISHING / SUPLANTACIÓN"
         verdict_color = "bold white on red"
         badge_style = "red"
@@ -1322,6 +1542,17 @@ def format_intel_details(res: Dict[str, Any], details: str) -> Text:
     return rendered
 
 
+def format_deobf_verdict_badge(verdict: str) -> Text:
+    """Genera insignias para los veredictos forenses de desofuscación."""
+    v = (verdict or "").upper().strip()
+    if v == "MALICIOSO":
+        return Text(" ✖ MALICIOSO ", style="bold white on red")
+    elif v == "SOSPECHOSO":
+        return Text(" ! SOSPECHOSO ", style="bold black on yellow")
+    else:
+        return Text(" ✔ INOCUO ", style="bold white on green")
+
+
 def render_eml_analysis(
     data: Dict[str, Any],
     vt_results: Optional[List[Dict[str, Any]]] = None,
@@ -1330,7 +1561,7 @@ def render_eml_analysis(
     cyberchef_results: Optional[List[Dict[str, Any]]] = None,
 ):
     """Muestra el reporte estilizado en terminal para un archivo EML."""
-    eval_res = evaluate_email_security(data, vt_results)
+    eval_res = evaluate_email_security(data, vt_results, deobfuscation_results=cyberchef_results)
 
     console.print()
     console.rule(f"[bold cyan]🔍 Análisis Forense de Correo: {data['file']}[/bold cyan]")
@@ -1483,32 +1714,75 @@ def render_eml_analysis(
             border_style="dim blue"
         ))
 
-    # 5. Desofuscación de Contenido (Chepy / Local)
+    # 5. Desofuscación y Análisis Forense de Carga Útil (Chepy / MITRE ATT&CK T1027)
     if cyberchef_results:
-        deobf_lines = []
-        for result in cyberchef_results:
-            status = result.get("status")
-            if status == "success":
-                original = result.get("input", "")
-                decoded = result.get("output", "")
-                engine = result.get("engine", "Chepy / Local")
-                if len(original) > 180:
-                    original = original[:177] + "..."
-                if len(decoded) > 1_000:
-                    decoded = decoded[:997] + "..."
-                deobf_lines.append(
-                    f"[bold cyan]Entrada detectada:[/bold cyan] {original}\n"
-                    f"[bold green]Resultado ({engine}):[/bold green] {decoded}"
+        meaningful = [r for r in cyberchef_results if not r.get("is_noise", False) and r.get("status") == "success"]
+        noise = [r for r in cyberchef_results if r.get("is_noise", False) and r.get("status") == "success"]
+        skipped = [r for r in cyberchef_results if r.get("status") in ("skipped", "unavailable", "unresolved", "error")]
+
+        if meaningful:
+            deobf_table = Table(box=box.ROUNDED, expand=True)
+            deobf_table.add_column("Técnica / Tipo", style="bold cyan", width=22)
+            deobf_table.add_column("Contenido Extraído", style="white", ratio=2, overflow="fold")
+            deobf_table.add_column("Interpretación Forense (Intención)", style="dim white", ratio=3, overflow="fold")
+            deobf_table.add_column("Impacto C-I-A", style="white", ratio=2, overflow="fold")
+            deobf_table.add_column("Veredicto", justify="center", width=14)
+
+            for item in meaningful:
+                content = item.get("extracted_content", "")
+                if len(content) > 120:
+                    content = content[:117] + "..."
+                interp = item.get("forensic_interpretation", "N/A")
+                impact = item.get("cia_impact", "N/A")
+                deobf_table.add_row(
+                    f"{item.get('label', 'Carga')}\n[dim]({item.get('method', 'Chepy')})[/dim]",
+                    content,
+                    interp,
+                    impact,
+                    format_deobf_verdict_badge(item.get("verdict", "INOCUO")),
                 )
-            elif status == "unavailable":
-                deobf_lines.append(f"[yellow]⚠️ {result.get('message', '')}[/yellow]")
-            else:
-                deobf_lines.append(f"[yellow]⚠️ {result.get('message', 'Fragmento omitido.')}[/yellow]")
-        console.print(Panel(
-            "\n\n".join(deobf_lines),
-            title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
-            border_style="green",
-        ))
+
+            console.print(Panel(
+                deobf_table,
+                title="[bold]🧪 Desofuscación y Clasificación de Amenazas (Chepy / MITRE T1027)[/bold]",
+                border_style="red" if any(i.get("verdict") == "MALICIOSO" for i in meaningful) else "yellow",
+            ))
+
+            # Ficha Forense estructurada lista para el informe del TP
+            for item in meaningful:
+                if item.get("verdict") in ("MALICIOSO", "SOSPECHOSO"):
+                    ficha_text = (
+                        f"• [bold cyan]Técnica de Evasión:[/bold cyan] {item.get('threat_type', 'Evasión de Defensas (MITRE T1027)')}\n"
+                        f"• [bold cyan]Mecanismo de Ofuscación:[/bold cyan] {item.get('method', 'Codificación')}\n"
+                        f"• [bold cyan]Intención del Atacante:[/bold cyan] {item.get('forensic_interpretation', 'N/A')}\n"
+                        f"• [bold cyan]Impacto C-I-A (Seguridad):[/bold cyan] {item.get('cia_impact', 'N/A')}\n"
+                        f"• [bold cyan]Recomendación de Mitigación:[/bold cyan] {item.get('recommendation', 'N/A')}"
+                    )
+                    console.print(Panel(
+                        ficha_text,
+                        title=f"[bold]📋 Ficha de Análisis Forense (Lista para el Informe del TP) — {item.get('label', 'Hallazgo')}[/bold]",
+                        border_style="bold red" if item.get("verdict") == "MALICIOSO" else "yellow",
+                    ))
+
+        if noise:
+            noise_summary = (
+                f"[dim]ℹ️ Se procesaron {len(noise)} fragmento(s) codificado(s) correspondientes a parámetros de URLs. "
+                "Fueron verificados y clasificados como [bold]tokens de telemetría / seguimiento de campañas inocuos[/bold] "
+                "(descartados: no contienen comandos de consola, ejecutables ni enlaces maliciosos ocultos).[/dim]"
+            )
+            console.print(Panel(
+                noise_summary,
+                title="[bold]🧪 Desofuscación de Telemetría (Tokens Inocuos)[/bold]",
+                border_style="dim green",
+            ))
+
+        if not meaningful and not noise:
+            msg = skipped[0].get("message", "Fragmento omitido.") if skipped else "No se pudo interpretar el contenido."
+            console.print(Panel(
+                f"[yellow]⚠️ {msg}[/yellow]",
+                title="[bold]🧪 Desofuscación de Contenido (Chepy / Local)[/bold]",
+                border_style="yellow",
+            ))
     else:
         console.print(Panel(
             "[dim]No se detectaron fragmentos Base64, URL-encoded o hexadecimales para procesar.[/dim]",
